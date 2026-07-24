@@ -1,0 +1,431 @@
+/* ==========================================================
+   デザイントークン
+   コンセプト: 古い航海図 / 天球儀の書斎。深いインク紺の紙面に
+   金の罫線と朱の封蝋が浮かぶ配色。
+   ========================================================== */
+:root {
+  --bg: #0b111c;
+  --bg-panel: #121a29;
+  --bg-panel-raised: #172236;
+  --border: #2a3547;
+  --border-soft: #1c2637;
+  --gold: #c9a44c;
+  --gold-dim: #8a7038;
+  --crimson: #a8453f;
+  --ink-green: #4f7a63;
+  --text-main: #e8e2d0;
+  --text-muted: #8a92a6;
+  --text-faint: #566178;
+
+  --font-display: "Iowan Old Style", "Palatino Linotype", Georgia, "Hiragino Mincho ProN", "Noto Serif JP", serif;
+  --font-body: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic", "Segoe UI", sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Courier New", monospace;
+
+  --radius: 4px;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-main);
+  font-family: var(--font-body);
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+}
+
+#app {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- ヘッダー ---------- */
+.top-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 18px;
+  padding-top: max(10px, env(safe-area-inset-top));
+  background: linear-gradient(180deg, var(--bg-panel-raised), var(--bg-panel));
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.top-bar__title {
+  font-family: var(--font-display);
+  font-size: 1.05rem;
+  letter-spacing: 0.04em;
+  color: var(--gold);
+  white-space: nowrap;
+}
+
+.top-bar__year {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  border-left: 1px solid var(--border);
+  padding-left: 14px;
+}
+
+.top-bar__spacer { flex: 1; }
+
+/* ---------- ボタン共通 ---------- */
+button {
+  font-family: var(--font-body);
+  cursor: pointer;
+}
+
+.btn {
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--border);
+  color: var(--text-main);
+  padding: 8px 14px;
+  border-radius: var(--radius);
+  font-size: 0.85rem;
+  transition: border-color 0.15s ease, transform 0.1s ease;
+}
+.btn:hover { border-color: var(--gold-dim); }
+.btn:active { transform: translateY(1px); }
+
+.btn--primary {
+  background: linear-gradient(180deg, #3a4a2f, #2c3a24);
+  border-color: var(--ink-green);
+  color: #dce8d8;
+  font-weight: 600;
+}
+.btn--primary:hover { border-color: #79a882; }
+
+.btn--gold {
+  border-color: var(--gold-dim);
+  color: var(--gold);
+}
+.btn--gold:hover { border-color: var(--gold); }
+
+.btn--danger {
+  border-color: #6e2f2b;
+  color: #e0a29c;
+}
+.btn--danger:hover { border-color: var(--crimson); }
+
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ---------- レイアウト ---------- */
+.main-layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 340px;
+  min-height: 0;
+}
+
+@media (max-width: 860px) {
+  .main-layout { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+}
+
+.map-panel {
+  position: relative;
+  min-height: 0;
+  background: radial-gradient(ellipse at 50% 30%, #0f1826 0%, #080c14 100%);
+  overflow: hidden;
+}
+
+#world-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+}
+
+/* 四隅のコンパス罫線装飾 */
+.map-panel::before,
+.map-panel::after {
+  content: "";
+  position: absolute;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--gold-dim);
+  opacity: 0.5;
+  pointer-events: none;
+}
+.map-panel::before { top: 10px; left: 10px; border-right: none; border-bottom: none; }
+.map-panel::after { bottom: 10px; right: 10px; border-left: none; border-top: none; }
+
+.map-legend {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  display: flex;
+  gap: 10px;
+  font-size: 0.65rem;
+  color: var(--text-faint);
+  background: rgba(11, 17, 28, 0.7);
+  padding: 4px 8px;
+  border-radius: var(--radius);
+  pointer-events: none;
+}
+
+.selection-tag {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  font-family: var(--font-display);
+  font-size: 0.8rem;
+  color: var(--gold);
+  background: rgba(11, 17, 28, 0.75);
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  pointer-events: none;
+}
+
+/* ---------- サイドパネル ---------- */
+.side-panel {
+  background: var(--bg-panel);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+@media (max-width: 860px) {
+  .side-panel { border-left: none; border-top: 1px solid var(--border); max-height: 46vh; }
+}
+
+.tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+
+.tab {
+  flex: 1;
+  padding: 10px 6px;
+  text-align: center;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+}
+.tab.active {
+  color: var(--gold);
+  border-bottom-color: var(--gold);
+}
+
+.tab-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+/* ---------- 共通カード ---------- */
+.card {
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+.card:hover { border-color: var(--gold-dim); }
+.card.selected { border-color: var(--gold); }
+
+.card__title {
+  font-family: var(--font-display);
+  font-size: 0.95rem;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.card__meta {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  margin-top: 3px;
+  font-family: var(--font-mono);
+}
+
+.swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.section-title {
+  font-family: var(--font-display);
+  font-size: 0.75rem;
+  color: var(--text-faint);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin: 4px 0 8px;
+}
+
+/* ---------- 詳細パネル (国家/人物) ---------- */
+.detail-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.detail-header h3 {
+  font-family: var(--font-display);
+  margin: 0;
+  color: var(--gold);
+}
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  font-size: 0.78rem;
+  margin: 10px 0;
+}
+
+.stat-grid div { color: var(--text-muted); }
+.stat-grid strong { color: var(--text-main); font-family: var(--font-mono); font-weight: 500; }
+
+/* ---------- 年表 / ニュース ---------- */
+.event-item {
+  border-left: 2px solid var(--border);
+  padding: 4px 0 10px 10px;
+  margin-bottom: 2px;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+.event-item--war { border-left-color: var(--crimson); }
+.event-item--diplomacy { border-left-color: var(--gold-dim); }
+.event-item--nature { border-left-color: var(--ink-green); }
+.event-item--ai { border-left-color: #6f7fd6; }
+
+.event-year {
+  font-family: var(--font-mono);
+  color: var(--text-faint);
+  font-size: 0.68rem;
+  display: block;
+}
+
+/* ---------- 神の力パネル ---------- */
+.god-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.god-action {
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 10px 8px;
+  text-align: center;
+  color: var(--text-main);
+  font-size: 0.78rem;
+}
+.god-action:hover { border-color: var(--gold-dim); }
+.god-action__icon { font-size: 1.3rem; display: block; margin-bottom: 4px; }
+
+/* ---------- チャット ---------- */
+.chat-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+.chat-log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 2px;
+}
+.chat-msg {
+  margin-bottom: 10px;
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+.chat-msg__speaker {
+  font-family: var(--font-display);
+  color: var(--gold);
+  font-size: 0.78rem;
+  display: block;
+  margin-bottom: 2px;
+}
+.chat-msg--player .chat-msg__speaker { color: var(--text-muted); }
+.chat-input-row {
+  display: flex;
+  gap: 6px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  margin-top: 6px;
+}
+.chat-input-row input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text-main);
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  font-size: 0.85rem;
+}
+.chat-input-row input:focus { outline: none; border-color: var(--gold-dim); }
+
+.empty-hint {
+  color: var(--text-faint);
+  font-size: 0.8rem;
+  text-align: center;
+  padding: 30px 10px;
+  font-family: var(--font-display);
+}
+
+/* ---------- モーダル ---------- */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(5, 8, 13, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  padding: 16px;
+}
+.modal {
+  background: var(--bg-panel);
+  border: 1px solid var(--gold-dim);
+  border-radius: var(--radius);
+  max-width: 420px;
+  width: 100%;
+  max-height: 84vh;
+  overflow-y: auto;
+  padding: 18px;
+}
+.modal h2 {
+  font-family: var(--font-display);
+  color: var(--gold);
+  margin-top: 0;
+  font-size: 1.1rem;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+/* ---------- 設定 ---------- */
+.settings-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 0.82rem;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
