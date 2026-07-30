@@ -11,6 +11,67 @@ function fill(template: string, ctx: Record<string, string | number>): string {
 }
 
 const TEMPLATES: Record<string, string[]> = {
+  armyRaised: [
+    "{year}年、{nation}は{army}を編成し、{general}を総司令に任じた。"
+  ],
+  fieldBattle: [
+    "{year}年、{place}で{nation}軍と{enemy}軍が激突し、{nation}が勝利した。",
+    "{year}年、{general}率いる{nation}軍が{place}の会戦で{enemy}軍を撃破した。"
+  ],
+  armyDestroyed: [
+    "{year}年、{nation}の{army}は{place}で壊滅した。"
+  ],
+  siegeStart: [
+    "{year}年、{nation}軍が{enemy}の都市{city}を包囲した。"
+  ],
+  siegeBroken: [
+    "{year}年、{city}の包囲は解かれ、{nation}軍は撤退した。"
+  ],
+  tileTaken: [
+    "{year}年、{nation}軍が{enemy}の国境地帯を占領した。"
+  ],
+  settlers: [
+    "{year}年、{nation}の入植者たちが辺境へ移り住んだ。"
+  ],
+  spySabotage: [
+    "{year}年、{nation}の密偵{spy}が{enemy}の国庫に火を放った。"
+  ],
+  spyStealTech: [
+    "{year}年、{nation}の密偵{spy}が{enemy}の技術を持ち帰った。"
+  ],
+  spyIncite: [
+    "{year}年、{enemy}の{city}で扇動者が暗躍し、民衆の不満が高まった。"
+  ],
+  spyAssassinate: [
+    "{year}年、{enemy}の王{victim}が暗殺された。下手人の影は{nation}へ消えたという。"
+  ],
+  spyCaught: [
+    "{year}年、{enemy}で{nation}の密偵{spy}が捕らえられ、両国の関係は険悪になった。"
+  ],
+  coup: [
+    "{year}年、{nation}の{general}が兵を返し、玉座を奪った。{dynasty}の始まりである。"
+  ],
+  defect: [
+    "{year}年、{nation}の{person}が{enemy}へ亡命した。"
+  ],
+  cityRevolt: [
+    "{year}年、{nation}の都市{city}が反旗を翻し、{rebel}として独立した。"
+  ],
+  pretender: [
+    "{year}年、{nation}で王位僭称者{person}が挙兵した。"
+  ],
+  festival: [
+    "{year}年、{nation}で{priest}による大祭が催され、民の心は安らいだ。"
+  ],
+  treaty: [
+    "{year}年、{nation}の{diplomat}の尽力で、{enemy}との緊張が和らいだ。"
+  ],
+  truce: [
+    "{year}年、{nation}と{enemy}は休戦協定を結んだ。"
+  ],
+  renamed: [
+    "{year}年、{old}は{new}と呼ばれるようになった。"
+  ],
   founding: [
     "{year}年、{king}を初代の王として{nation}が建国された。",
     "{year}年、{nation}が{capital}を都と定めて興った。"
@@ -170,7 +231,8 @@ export function generateTemplateEvent(
   rng: Rng,
   nationIds: string[] = [],
   personIds: string[] = [],
-  importance: Importance = 0
+  importance: Importance = 0,
+  pos?: { x: number; y: number }
 ): WorldEvent {
   const pool = TEMPLATES[key] ?? [`{year}年、{nation}に何かが起きた。`];
   const template = rng.pick(pool);
@@ -181,7 +243,9 @@ export function generateTemplateEvent(
     text: fill(template, { year, ...ctx }),
     nationIds,
     personIds,
-    importance
+    importance,
+    x: pos?.x,
+    y: pos?.y
   };
 }
 

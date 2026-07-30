@@ -44,10 +44,12 @@ export function createNation(
     techLevel: rng.int(1, 3),
     stability: rng.int(55, 85),
     warExhaustion: 0,
+    legitimacy: rng.int(60, 90),
     kingId: null,
     overlordId: null,
+    armyIds: [],
     relations: {},
-    laws: { taxRate: 0.12, militaryFocus: false, tradeOpen: true },
+    laws: { taxRate: 0.12, militaryFocus: false, tradeOpen: true, conscription: false },
     stats: [],
     alive: true
   };

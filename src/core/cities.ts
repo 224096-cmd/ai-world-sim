@@ -33,7 +33,9 @@ export function createCity(
     isCapital,
     population: 0,
     prosperity: isCapital ? rng.int(45, 60) : rng.int(20, 35),
-    fortification: isCapital ? rng.int(25, 40) : rng.int(8, 20)
+    fortification: isCapital ? rng.int(25, 40) : rng.int(8, 20),
+    unrest: 0,
+    siegeBy: null
   };
 }
 
@@ -45,7 +47,7 @@ export function findCitySite(
   nation: Nation,
   map: WorldMap,
   cities: City[],
-  minDistance = 3
+  minDistance = 4
 ): { x: number; y: number } | null {
   let best: { x: number; y: number } | null = null;
   let bestScore = 0;
@@ -110,6 +112,11 @@ export function updateCities(nation: Nation, cities: City[], rng: Rng): void {
     if (city.fortification < fortGoal && nation.treasury > 120) {
       city.fortification = Math.min(100, city.fortification + 0.6);
     }
+    // 不満度: 安定度が低い・包囲されている都市はじわじわ荒れる
+    const unrestDelta =
+      (45 - nation.stability) * 0.05 + (city.siegeBy ? 3 : -0.8) + (city.isCapital ? -0.4 : 0);
+    city.unrest = clamp(city.unrest + unrestDelta, 0, 100);
+
     total += city.prosperity;
   }
 

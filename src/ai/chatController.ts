@@ -11,10 +11,13 @@ interface ChatLine {
 
 const ROLE_LABEL: Record<string, string> = {
   king: "王",
-  heir: "王",
+  heir: "世継ぎ",
   general: "将軍",
   merchant: "商人",
-  scholar: "学者"
+  scholar: "学者",
+  spy: "密偵",
+  priest: "司祭",
+  diplomat: "外交官"
 };
 
 export class ChatController {
@@ -76,7 +79,7 @@ export class ChatController {
 
       const prompt = this.buildPrompt(person, nation, history, text);
       const { text: replyText } = await aiService.generate(prompt, () =>
-        fallbackChatReply(person, nation, this.chatRng)
+        fallbackChatReply(person, nation, this.chatRng, text)
       );
 
       thinking.remove();

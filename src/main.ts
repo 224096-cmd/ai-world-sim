@@ -1,7 +1,19 @@
 import "./style.css";
 import "./ui/ui-extra.css";
 import { GameWorld, SNAPSHOT_VERSION, WorldSnapshot } from "./core/simulation";
-import { City, EventCategory, MapMode, MAP_MODE_LABEL, Nation, RESOURCE_LABEL, WorldConfig } from "./core/types";
+import {
+  Army,
+  City,
+  EventCategory,
+  MapMode,
+  MAP_MODE_LABEL,
+  Nation,
+  Person,
+  PersonRole,
+  RESOURCE_LABEL,
+  TERRAIN_LABEL,
+  WorldConfig
+} from "./core/types";
 import { MapRenderer } from "./ui/renderer";
 import {
   renderNationList,
@@ -11,72 +23,75 @@ import {
   renderHistory
 } from "./ui/panels";
 import { renderStatsTab, StatMetric } from "./ui/charts";
-import { renderGodPanel, GodActionDef, GodActionKind } from "./ui/godActions";
+import { renderGodPanel, GodActionDef } from "./ui/godActions";
 import { ChatController } from "./ai/chatController";
-import { aiService, DEFAULT_MODEL_ID, LIGHT_MODEL_ID } from "./ai/aiService";
+import { aiService } from "./ai/aiService";
+import { renderAd, resetAdRotation } from "./ads";
 import { setupPWA } from "./pwaRegister";
 
 const SAVE_KEY = "ai-world-sim:save";
 type TabId = "nations" | "people" | "history" | "stats" | "god" | "settings";
 
-// 自動進行の速度 (ミリ秒)
+const TABS: { id: TabId; icon: string; label: string }[] = [
+  { id: "nations", icon: "🏰", label: "国家" },
+  { id: "people", icon: "👤", label: "人物" },
+  { id: "history", icon: "📜", label: "年表" },
+  { id: "stats", icon: "📊", label: "統計" },
+  { id: "god", icon: "✦", label: "神の力" },
+  { id: "settings", icon: "⚙", label: "設定" }
+];
+
 const SPEEDS = [
-  { label: "×1", interval: 1400 },
-  { label: "×2", interval: 700 },
-  { label: "×4", interval: 300 }
+  { label: "×1", interval: 1600 },
+  { label: "×2", interval: 800 },
+  { label: "×4", interval: 380 },
+  { label: "×8", interval: 170 }
 ];
 
 // ==============================================================
-// 画面の骨格
+// 画面の骨格 (地図を全面に敷き、UIは重ねる)
 // ==============================================================
 const app = document.getElementById("app")!;
 app.innerHTML = `
-  <div class="top-bar">
-    <div class="top-bar__title">🌍 AI世界シミュレーター</div>
-    <div class="top-bar__year" id="year-display">1年</div>
-    <div class="top-bar__faith" id="faith-display">信仰 30</div>
-    <div class="top-bar__spacer"></div>
-    <button class="btn btn--primary" id="btn-next-year">次の年へ</button>
-    <div class="speed-group" id="speed-group"></div>
-    <button class="btn" id="btn-new-world">新しい世界</button>
+  <canvas id="world-canvas"></canvas>
+
+  <div class="hud hud--top">
+    <button class="hud-btn" id="btn-panel" title="パネル">☰</button>
+    <div class="hud-chip" id="year-display">1年</div>
+    <div class="hud-chip hud-chip--faith" id="faith-display">✦ 30</div>
+    <div class="hud-spacer"></div>
+    <div class="hud-group" id="speed-group"></div>
   </div>
-  <div class="main-layout">
-    <div class="map-panel">
-      <canvas id="world-canvas"></canvas>
-      <div class="map-modes" id="map-modes"></div>
-      <div class="map-zoom">
-        <button class="btn btn--icon" id="btn-zoom-in">＋</button>
-        <button class="btn btn--icon" id="btn-zoom-out">−</button>
-        <button class="btn btn--icon" id="btn-zoom-reset">⤢</button>
-      </div>
-      <div class="selection-tag" id="selection-tag" style="display:none;"></div>
-      <div class="tile-inspector" id="tile-inspector" style="display:none;"></div>
-      <div class="map-legend">ドラッグで移動 / ホイール・ピンチで拡大 / タップで選択</div>
-    </div>
-    <div class="side-panel">
-      <div class="tabs">
-        <button class="tab active" data-tab="nations">国家</button>
-        <button class="tab" data-tab="people">人物</button>
-        <button class="tab" data-tab="history">年表</button>
-        <button class="tab" data-tab="stats">統計</button>
-        <button class="tab" data-tab="god">神の力</button>
-        <button class="tab" data-tab="settings">設定</button>
-      </div>
-      <div class="tab-content" id="tab-content"></div>
-    </div>
+
+  <div class="map-modes" id="map-modes"></div>
+
+  <div class="map-tools">
+    <button class="hud-btn" id="btn-zoom-in">＋</button>
+    <button class="hud-btn" id="btn-zoom-out">−</button>
+    <button class="hud-btn" id="btn-zoom-reset">⤢</button>
+    <button class="hud-btn" id="btn-labels" title="名前の表示">🏷</button>
   </div>
+
+  <div class="tile-inspector" id="tile-inspector" style="display:none;"></div>
   <div class="toast-stack" id="toast-stack"></div>
+
+  <section class="panel" id="panel">
+    <button class="panel__handle" id="panel-handle"><span></span></button>
+    <nav class="panel__tabs" id="panel-tabs"></nav>
+    <div class="panel__body" id="tab-content"></div>
+  </section>
+
   <div id="modal-root"></div>
 `;
 
 const yearDisplay = document.getElementById("year-display")!;
 const faithDisplay = document.getElementById("faith-display")!;
 const tabContent = document.getElementById("tab-content")!;
-const selectionTag = document.getElementById("selection-tag")!;
 const tileInspector = document.getElementById("tile-inspector")!;
 const canvas = document.getElementById("world-canvas") as HTMLCanvasElement;
 const modalRoot = document.getElementById("modal-root")!;
 const toastStack = document.getElementById("toast-stack")!;
+const panel = document.getElementById("panel")!;
 
 // ==============================================================
 // 状態
@@ -86,9 +101,11 @@ let renderer = new MapRenderer(canvas, world);
 let chat = new ChatController(world);
 
 let activeTab: TabId = "nations";
+let panelOpen = window.innerWidth > 900;
 let selectedNationId: string | null = null;
 let selectedPersonId: string | null = null;
-let peopleFilter: string | "all" = "all";
+let peopleNationFilter: string | "all" = "all";
+let peopleRoleFilter: PersonRole | "all" = "all";
 let historyCategory: EventCategory | "all" = "all";
 let historyKeyword = "";
 let historyMajorOnly = true;
@@ -96,32 +113,31 @@ let statMetric: StatMetric = "p";
 let speedIndex = 1;
 let autoPlay = false;
 let autoTimer: number | null = null;
+let lastTickAt = performance.now();
 let ticksSinceSave = 0;
-let ticksSincePanel = 0;
 
 function loadOrCreateWorld(): GameWorld {
   const raw = localStorage.getItem(SAVE_KEY);
   if (raw) {
     try {
-      const snapshot: WorldSnapshot = JSON.parse(raw);
-      const restored = GameWorld.fromSnapshot(snapshot);
+      const restored = GameWorld.fromSnapshot(JSON.parse(raw) as WorldSnapshot);
       if (restored) return restored;
       console.info("セーブデータの形式が古いため、新しい世界を生成します");
     } catch (err) {
-      console.warn("セーブデータの読み込みに失敗、新しい世界を生成します", err);
+      console.warn("セーブデータの読み込みに失敗しました", err);
     }
   }
   return createNewWorld();
 }
 
 function createNewWorld(config?: Partial<WorldConfig>): GameWorld {
-  const full: WorldConfig = {
-    width: config?.width ?? 52,
-    height: config?.height ?? 34,
-    nationCount: config?.nationCount ?? 7,
+  return GameWorld.create({
+    width: config?.width ?? 72,
+    height: config?.height ?? 46,
+    nationCount: config?.nationCount ?? 9,
+    landRatio: config?.landRatio ?? 0.55,
     seed: config?.seed ?? Math.floor(Math.random() * 2 ** 31)
-  };
-  return GameWorld.create(full);
+  });
 }
 
 function saveWorld() {
@@ -133,30 +149,34 @@ function saveWorld() {
 }
 
 // ==============================================================
-// 描画
+// 描画ループ
 // ==============================================================
-function refreshAll(panels = true) {
+function frame(now: number) {
+  if (!document.hidden) {
+    const duration = SPEEDS[speedIndex].interval;
+    const alpha = autoPlay ? Math.min(1, (now - lastTickAt) / duration) : 1;
+    renderer.draw({ type: selectedNationId ? "nation" : null, id: selectedNationId }, alpha, now);
+  }
+  requestAnimationFrame(frame);
+}
+
+function refreshHud() {
   yearDisplay.textContent = `${world.year}年`;
-  faithDisplay.textContent = `信仰 ${world.faith}`;
-  renderer.draw({ type: selectedNationId ? "nation" : null, id: selectedNationId });
-  updateSelectionTag();
+  faithDisplay.textContent = `✦ ${world.faith}`;
+}
+
+function refreshAll(panels = true) {
+  refreshHud();
+  renderer.invalidate();
   if (panels) renderActiveTab();
 }
 
-function updateSelectionTag() {
-  const nation = selectedNationId ? world.getNation(selectedNationId) : undefined;
-  if (nation) {
-    selectionTag.style.display = "block";
-    selectionTag.innerHTML = `<span class="swatch" style="background:${nation.color}"></span>${nation.name}`;
-  } else {
-    selectionTag.style.display = "none";
-  }
-}
-
 function renderActiveTab() {
-  for (const btn of document.querySelectorAll<HTMLButtonElement>(".tab")) {
+  resetAdRotation();
+  for (const btn of document.querySelectorAll<HTMLButtonElement>(".panel-tab")) {
     btn.classList.toggle("active", btn.dataset.tab === activeTab);
   }
+  tabContent.scrollTop = tabContent.scrollTop;
 
   switch (activeTab) {
     case "nations":
@@ -169,12 +189,17 @@ function renderActiveTab() {
       renderHistoryTab();
       break;
     case "stats":
-      renderStatsTab(tabContent, world, statMetric, (m) => {
-        statMetric = m;
-        renderActiveTab();
-      }, (id) => {
-        selectNation(id);
-      });
+      renderStatsTab(
+        tabContent,
+        world,
+        statMetric,
+        (m) => {
+          statMetric = m;
+          renderActiveTab();
+        },
+        (id) => selectNation(id)
+      );
+      renderAd(tabContent, "panel-bottom");
       break;
     case "god":
       renderGodTab();
@@ -188,16 +213,17 @@ function renderActiveTab() {
 function selectNation(id: string | null) {
   selectedNationId = id;
   activeTab = "nations";
+  openPanel(true);
   refreshAll();
 }
 
-// -------- 国家タブ --------
+// -------- 国家 --------
 function renderNationsTab() {
   tabContent.innerHTML = "";
   const selected = selectedNationId ? world.getNation(selectedNationId) : undefined;
 
   if (selected && selected.alive) {
-    tabContent.appendChild(backButton("← 国家一覧に戻る", () => selectNation(null)));
+    tabContent.appendChild(backButton("← 国家一覧", () => selectNation(null)));
     const detail = document.createElement("div");
     tabContent.appendChild(detail);
     renderNationDetail(detail, world, selected, {
@@ -207,10 +233,26 @@ function renderNationsTab() {
         refreshAll();
       },
       onFocusCity: (city: City) => {
-        renderer.focusOn(city.x, city.y, 3.2);
-        refreshAll(false);
+        renderer.focusOn(city.x, city.y, 4);
       },
-      onSelectNation: (id) => selectNation(id)
+      onFocusArmy: (army: Army) => {
+        renderer.focusOn(army.x, army.y, 4);
+      },
+      onSelectNation: (id) => selectNation(id),
+      onRenameNation: (nation) =>
+        promptModal("国名を変更", nation.name, (value) => {
+          if (world.renameNation(nation.id, value)) {
+            saveWorld();
+            refreshAll();
+          }
+        }),
+      onRenameCity: (city) =>
+        promptModal("都市名を変更", city.name, (value) => {
+          if (world.renameCity(city.id, value)) {
+            saveWorld();
+            refreshAll();
+          }
+        })
     });
   } else {
     const list = document.createElement("div");
@@ -219,34 +261,37 @@ function renderNationsTab() {
   }
 }
 
-// -------- 人物タブ --------
+// -------- 人物 --------
 function renderPeopleTab() {
   tabContent.innerHTML = "";
   const selected = selectedPersonId ? world.getPerson(selectedPersonId) : undefined;
 
   if (selected && selected.alive) {
     tabContent.appendChild(
-      backButton("← 人物一覧に戻る", () => {
+      backButton("← 人物一覧", () => {
         selectedPersonId = null;
         refreshAll();
       })
     );
-
     const detail = document.createElement("div");
     tabContent.appendChild(detail);
-    renderPersonDetail(detail, world, selected);
+    renderPersonDetail(detail, world, selected, (person: Person) =>
+      promptModal("名前を変更", person.name, (value) => {
+        if (world.renamePerson(person.id, value)) {
+          saveWorld();
+          refreshAll();
+        }
+      })
+    );
 
     const nation = world.getNation(selected.nationId);
     if (nation) {
-      const chatTitle = document.createElement("div");
-      chatTitle.className = "section-title";
-      chatTitle.textContent = "対話 (AI/フォールバック)";
-      tabContent.appendChild(chatTitle);
-
+      tabContent.appendChild(sectionTitle("対話"));
       const chatBox = document.createElement("div");
-      chatBox.style.height = "300px";
+      chatBox.style.height = "280px";
       tabContent.appendChild(chatBox);
       chat.render(chatBox, selected, nation, () => {});
+      renderAd(tabContent, "compact");
     }
   } else {
     const list = document.createElement("div");
@@ -255,51 +300,52 @@ function renderPeopleTab() {
       list,
       world,
       selectedPersonId,
-      peopleFilter,
+      peopleNationFilter,
+      peopleRoleFilter,
       (id) => {
         selectedPersonId = id;
         refreshAll();
       },
       (filter) => {
-        peopleFilter = filter;
+        peopleNationFilter = filter;
+        renderActiveTab();
+      },
+      (role) => {
+        peopleRoleFilter = role;
         renderActiveTab();
       }
     );
   }
 }
 
-// -------- 年表タブ --------
+// -------- 年表 --------
 function renderHistoryTab() {
   tabContent.innerHTML = "";
 
   const search = document.createElement("input");
   search.type = "search";
   search.className = "search-input";
-  search.placeholder = "国名・人名・出来事で検索...";
+  search.placeholder = "国名・人名・出来事で検索";
   search.value = historyKeyword;
   search.addEventListener("input", () => {
     historyKeyword = search.value;
-    renderHistory(list, world, {
-      category: historyCategory,
-      keyword: historyKeyword,
-      majorOnly: historyMajorOnly
-    });
+    draw();
   });
   tabContent.appendChild(search);
 
   const filterRow = document.createElement("div");
   filterRow.className = "chip-row";
-
   const filters: [EventCategory | "all", string][] = [
     ["all", "すべて"],
     ["war", "戦争"],
     ["diplomacy", "外交"],
+    ["intrigue", "謀略"],
     ["succession", "継承"],
     ["city", "都市"],
-    ["nature", "天災/豊作"],
+    ["nature", "天災"],
     ["economy", "経済"],
     ["discovery", "技術"],
-    ["divine", "神の力"]
+    ["divine", "神"]
   ];
   for (const [key, label] of filters) {
     const btn = document.createElement("button");
@@ -311,10 +357,9 @@ function renderHistoryTab() {
     });
     filterRow.appendChild(btn);
   }
-
   const majorChip = document.createElement("button");
   majorChip.className = "chip" + (historyMajorOnly ? " chip--active" : "");
-  majorChip.textContent = historyMajorOnly ? "重要な出来事のみ" : "些細な出来事も表示";
+  majorChip.textContent = historyMajorOnly ? "重要のみ" : "すべての事件";
   majorChip.addEventListener("click", () => {
     historyMajorOnly = !historyMajorOnly;
     renderHistoryTab();
@@ -324,14 +369,19 @@ function renderHistoryTab() {
 
   const list = document.createElement("div");
   tabContent.appendChild(list);
-  renderHistory(list, world, {
-    category: historyCategory,
-    keyword: historyKeyword,
-    majorOnly: historyMajorOnly
-  });
+
+  function draw() {
+    renderHistory(
+      list,
+      world,
+      { category: historyCategory, keyword: historyKeyword, majorOnly: historyMajorOnly },
+      (x, y) => renderer.focusOn(x, y, 4)
+    );
+  }
+  draw();
 }
 
-// -------- 神の力タブ --------
+// -------- 神の力 --------
 function renderGodTab() {
   tabContent.innerHTML = "";
   renderGodPanel(tabContent, world.faith, world.faithRegen(), (action) => {
@@ -339,9 +389,7 @@ function renderGodTab() {
       showToast("信仰力が足りません", "warn");
       return;
     }
-    openNationPicker(`${action.label}: 対象の国家`, (nation) => {
-      void handleGodAction(action, nation);
-    });
+    openNationPicker(`${action.label}: 対象の国家`, (nation) => void handleGodAction(action, nation));
   });
 
   if (world.godLog.length > 0) {
@@ -353,13 +401,13 @@ function renderGodTab() {
       tabContent.appendChild(row);
     }
   }
+
+  renderAd(tabContent, "panel-bottom");
 }
 
 async function handleGodAction(action: GodActionDef, nation: Nation) {
-  const kind: GodActionKind = action.kind;
   let ok: unknown = null;
-
-  switch (kind) {
+  switch (action.kind) {
     case "disaster": ok = world.godDisaster(nation.id); break;
     case "blessing": ok = world.godBlessing(nation.id); break;
     case "resource": ok = world.godDiscoverResource(nation.id); break;
@@ -372,6 +420,7 @@ async function handleGodAction(action: GodActionDef, nation: Nation) {
     case "raiseTax": ok = world.godProclaimLaw(nation.id, "raiseTax"); break;
     case "militarize": ok = world.godProclaimLaw(nation.id, "militarize"); break;
     case "openTrade": ok = world.godProclaimLaw(nation.id, "openTrade"); break;
+    case "conscription": ok = world.godProclaimLaw(nation.id, "conscription"); break;
     case "oracle": ok = await handleOracle(nation); break;
   }
 
@@ -379,9 +428,8 @@ async function handleGodAction(action: GodActionDef, nation: Nation) {
     showToast("その力は今この国には及ばなかった", "warn");
     return;
   }
-
   world.spendFaith(action.cost);
-  showToast(`${nation.name}に ${action.label}`, "divine");
+  showToast(`${nation.name}に「${action.label}」`, "divine");
   saveWorld();
   refreshAll();
 }
@@ -400,126 +448,99 @@ async function handleOracle(nation: Nation) {
     () => `${nation.name}よ、汝の道は霧に包まれている。されど星々はまだ、その名を忘れてはいない。`,
     { maxNewTokens: 60 }
   );
-
   return world.recordAiNarrative("divine", text, [nation.id], king ? [king.id] : []);
 }
 
-// -------- 設定タブ --------
+// -------- 設定 --------
 function renderSettingsTab() {
   tabContent.innerHTML = "";
 
-  // --- 表示 ---
+  tabContent.appendChild(sectionTitle("世界"));
+  const newWorldBtn = document.createElement("button");
+  newWorldBtn.className = "btn btn--primary btn--wide";
+  newWorldBtn.textContent = "新しい世界を生成";
+  newWorldBtn.addEventListener("click", openNewWorldModal);
+  tabContent.appendChild(newWorldBtn);
+
   tabContent.appendChild(sectionTitle("表示"));
-  const labelRow = document.createElement("div");
-  labelRow.className = "settings-row";
-  labelRow.appendChild(document.createTextNode("地図に都市名を表示"));
-  const labelToggle = document.createElement("button");
-  labelToggle.className = "btn" + (renderer.showLabels ? " btn--gold" : "");
-  labelToggle.textContent = renderer.showLabels ? "ON" : "OFF";
-  labelToggle.addEventListener("click", () => {
-    renderer.showLabels = !renderer.showLabels;
-    renderSettingsTab();
-    refreshAll(false);
-  });
-  labelRow.appendChild(labelToggle);
-  tabContent.appendChild(labelRow);
-
-  // --- ローカルAI ---
-  tabContent.appendChild(sectionTitle("ローカルAI (約1GBのモデル)"));
-
-  const enableRow = document.createElement("div");
-  enableRow.className = "settings-row";
-  enableRow.appendChild(document.createTextNode("ローカルAIを有効化"));
-  const enableToggle = document.createElement("button");
-  enableToggle.className = "btn" + (aiService.enabled ? " btn--gold" : "");
-  enableToggle.textContent = aiService.enabled ? "ON" : "OFF";
-  enableToggle.addEventListener("click", () => {
-    aiService.enabled = !aiService.enabled;
-    renderSettingsTab();
-  });
-  enableRow.appendChild(enableToggle);
-  tabContent.appendChild(enableRow);
-
-  const modelRow = document.createElement("div");
-  modelRow.className = "settings-row";
-  modelRow.appendChild(document.createTextNode("モデルサイズ"));
-  const modelSelect = document.createElement("select");
-  modelSelect.className = "select";
-  modelSelect.innerHTML = `
-    <option value="${LIGHT_MODEL_ID}">軽量 (低スペック端末向け)</option>
-    <option value="${DEFAULT_MODEL_ID}">標準 (約1GB)</option>
-  `;
-  modelSelect.value = aiService.modelId;
-  modelSelect.addEventListener("change", () => {
-    aiService.modelId = modelSelect.value;
-  });
-  modelRow.appendChild(modelSelect);
-  tabContent.appendChild(modelRow);
-
-  const statusRow = document.createElement("div");
-  statusRow.className = "settings-row";
-  const statusText = document.createElement("span");
-  statusText.id = "ai-status-text";
-  statusText.className = "card__meta";
-  statusText.textContent = aiService.getStatus().message;
-  const loadBtn = document.createElement("button");
-  loadBtn.className = "btn btn--gold";
-  loadBtn.textContent = "モデルを読み込む";
-  loadBtn.addEventListener("click", async () => {
-    aiService.enabled = true;
-    await aiService.ensureLoaded();
-  });
-  statusRow.appendChild(statusText);
-  statusRow.appendChild(loadBtn);
-  tabContent.appendChild(statusRow);
-
-  const note = document.createElement("div");
-  note.className = "card__meta";
-  note.style.marginTop = "10px";
-  note.style.lineHeight = "1.6";
-  note.textContent =
-    "AIは王との会話・神託など「物語」が必要な場面のみ使用します。国家運営や戦争などの通常処理はAIなしで高速に動作します。無効時やモデル未読込時は自動的にテンプレート文で応答します。";
-  tabContent.appendChild(note);
-
-  // --- セーブデータ ---
-  tabContent.appendChild(sectionTitle("セーブデータ"));
-  const saveInfo = document.createElement("div");
-  saveInfo.className = "card__meta";
-  saveInfo.textContent = `この世界は自動保存されます (形式 v${SNAPSHOT_VERSION})`;
-  tabContent.appendChild(saveInfo);
-
-  const saveRow = document.createElement("div");
-  saveRow.className = "settings-row";
-  const exportBtn = document.createElement("button");
-  exportBtn.className = "btn";
-  exportBtn.textContent = "書き出し";
-  exportBtn.addEventListener("click", exportSave);
-  const importBtn = document.createElement("button");
-  importBtn.className = "btn";
-  importBtn.textContent = "読み込み";
-  importBtn.addEventListener("click", importSave);
-  const resetBtn = document.createElement("button");
-  resetBtn.className = "btn btn--danger";
-  resetBtn.textContent = "リセット";
-  resetBtn.addEventListener("click", () =>
-    confirmModal("本当に世界をリセットしますか?元に戻せません。", () => {
-      localStorage.removeItem(SAVE_KEY);
-      startNewWorld();
+  tabContent.appendChild(
+    toggleRow("地図に名前を表示", renderer.showLabels, () => {
+      renderer.showLabels = !renderer.showLabels;
+      renderSettingsTab();
     })
   );
-  saveRow.appendChild(exportBtn);
-  saveRow.appendChild(importBtn);
-  saveRow.appendChild(resetBtn);
-  tabContent.appendChild(saveRow);
+  tabContent.appendChild(
+    toggleRow("軍団と矢印を表示", renderer.showArmies, () => {
+      renderer.showArmies = !renderer.showArmies;
+      renderSettingsTab();
+    })
+  );
 
-  // --- 操作説明 ---
-  tabContent.appendChild(sectionTitle("キーボード操作"));
+  tabContent.appendChild(sectionTitle("会話"));
+  tabContent.appendChild(el("div", "card__meta", aiService.getStatus().message));
+  tabContent.appendChild(
+    el(
+      "div",
+      "card__meta",
+      "人物タブから王や将軍に話しかけると、役職と国の状況に応じた返答が返ります。外部への通信やモデルのダウンロードは一切ありません。"
+    )
+  );
+
+  tabContent.appendChild(sectionTitle("セーブデータ"));
+  const saveRow = document.createElement("div");
+  saveRow.className = "settings-row settings-row--buttons";
+  saveRow.appendChild(actionButton("書き出し", "btn", exportSave));
+  saveRow.appendChild(actionButton("読み込み", "btn", importSave));
+  saveRow.appendChild(
+    actionButton("リセット", "btn btn--danger", () =>
+      confirmModal("本当に世界をリセットしますか?元に戻せません。", () => {
+        localStorage.removeItem(SAVE_KEY);
+        startNewWorld();
+      })
+    )
+  );
+  tabContent.appendChild(saveRow);
+  tabContent.appendChild(
+    el("div", "card__meta", `自動保存されます (形式 v${SNAPSHOT_VERSION}) ・ ${world.events.length}件の記録`)
+  );
+
+  tabContent.appendChild(sectionTitle("操作"));
   const keys = document.createElement("div");
   keys.className = "card__meta";
-  keys.style.lineHeight = "1.8";
+  keys.style.lineHeight = "1.9";
   keys.innerHTML =
-    "Space: 1年進める<br>A: 自動進行の切替<br>1〜5: 地図モード切替<br>+ / -: 拡大・縮小<br>0: 全体表示に戻す";
+    "Space: 1年進める / A: 自動進行 / Tab: パネル開閉<br>1〜6: 地図モード / +・-: 拡大縮小 / 0: 全体表示<br>ドラッグ: 移動 / ピンチ・ホイール: 拡大";
   tabContent.appendChild(keys);
+
+  renderAd(tabContent, "compact");
+  renderAd(tabContent, "panel-bottom");
+}
+
+function toggleRow(label: string, value: boolean, onToggle: () => void): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "settings-row";
+  row.appendChild(document.createTextNode(label));
+  const btn = document.createElement("button");
+  btn.className = "btn" + (value ? " btn--gold" : "");
+  btn.textContent = value ? "ON" : "OFF";
+  btn.addEventListener("click", onToggle);
+  row.appendChild(btn);
+  return row;
+}
+
+function actionButton(label: string, className: string, onClick: () => void): HTMLElement {
+  const btn = document.createElement("button");
+  btn.className = className;
+  btn.textContent = label;
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
+function el(tag: string, className: string, text: string): HTMLElement {
+  const e = document.createElement(tag);
+  e.className = className;
+  e.textContent = text;
+  return e;
 }
 
 function exportSave() {
@@ -541,8 +562,7 @@ function importSave() {
     const file = input.files?.[0];
     if (!file) return;
     try {
-      const snapshot = JSON.parse(await file.text()) as WorldSnapshot;
-      const restored = GameWorld.fromSnapshot(snapshot);
+      const restored = GameWorld.fromSnapshot(JSON.parse(await file.text()) as WorldSnapshot);
       if (!restored) {
         showToast("このセーブデータは形式が異なります", "warn");
         return;
@@ -565,7 +585,7 @@ function importSave() {
 }
 
 // ==============================================================
-// 共通UI部品
+// 共通UI
 // ==============================================================
 function sectionTitle(text: string): HTMLElement {
   const e = document.createElement("div");
@@ -576,8 +596,7 @@ function sectionTitle(text: string): HTMLElement {
 
 function backButton(text: string, onClick: () => void): HTMLElement {
   const btn = document.createElement("button");
-  btn.className = "btn";
-  btn.style.marginBottom = "10px";
+  btn.className = "btn btn--back";
   btn.textContent = text;
   btn.addEventListener("click", onClick);
   return btn;
@@ -591,19 +610,31 @@ function showToast(message: string, kind: "info" | "warn" | "divine" | "major" =
   window.setTimeout(() => {
     toast.classList.add("toast--out");
     window.setTimeout(() => toast.remove(), 400);
-  }, 3600);
-
+  }, 3400);
   while (toastStack.children.length > 4) toastStack.removeChild(toastStack.firstChild!);
 }
 
-function openNationPicker(title: string, onPick: (nation: Nation) => void) {
+function modalShell(title: string): { backdrop: HTMLElement; modal: HTMLElement; actions: HTMLElement } {
   const backdrop = document.createElement("div");
   backdrop.className = "modal-backdrop";
   const modal = document.createElement("div");
   modal.className = "modal";
-  modal.appendChild(headingEl(title));
+  const h = document.createElement("h2");
+  h.textContent = title;
+  modal.appendChild(h);
+  const actions = document.createElement("div");
+  actions.className = "modal-actions";
+  backdrop.appendChild(modal);
+  backdrop.addEventListener("click", (e) => {
+    if (e.target === backdrop) closeModal();
+  });
+  return { backdrop, modal, actions };
+}
 
+function openNationPicker(title: string, onPick: (nation: Nation) => void) {
+  const { backdrop, modal, actions } = modalShell(title);
   const list = document.createElement("div");
+  list.className = "modal-list";
   for (const nation of world.livingNations()) {
     const card = document.createElement("div");
     card.className = "card";
@@ -617,78 +648,70 @@ function openNationPicker(title: string, onPick: (nation: Nation) => void) {
     list.appendChild(card);
   }
   modal.appendChild(list);
-
-  const actions = document.createElement("div");
-  actions.className = "modal-actions";
-  const cancel = document.createElement("button");
-  cancel.className = "btn";
-  cancel.textContent = "キャンセル";
-  cancel.addEventListener("click", closeModal);
-  actions.appendChild(cancel);
+  actions.appendChild(actionButton("キャンセル", "btn", closeModal));
   modal.appendChild(actions);
-
-  backdrop.appendChild(modal);
-  backdrop.addEventListener("click", (e) => {
-    if (e.target === backdrop) closeModal();
-  });
   modalRoot.appendChild(backdrop);
 }
 
 function confirmModal(message: string, onConfirm: () => void) {
-  const backdrop = document.createElement("div");
-  backdrop.className = "modal-backdrop";
-  const modal = document.createElement("div");
-  modal.className = "modal";
-  modal.appendChild(headingEl("確認"));
+  const { backdrop, modal, actions } = modalShell("確認");
   const p = document.createElement("p");
   p.textContent = message;
   p.style.color = "var(--text-muted)";
   modal.appendChild(p);
-
-  const actions = document.createElement("div");
-  actions.className = "modal-actions";
-  const cancel = document.createElement("button");
-  cancel.className = "btn";
-  cancel.textContent = "キャンセル";
-  cancel.addEventListener("click", closeModal);
-  const ok = document.createElement("button");
-  ok.className = "btn btn--danger";
-  ok.textContent = "実行";
-  ok.addEventListener("click", () => {
-    closeModal();
-    onConfirm();
-  });
-  actions.appendChild(cancel);
-  actions.appendChild(ok);
+  actions.appendChild(actionButton("キャンセル", "btn", closeModal));
+  actions.appendChild(
+    actionButton("実行", "btn btn--danger", () => {
+      closeModal();
+      onConfirm();
+    })
+  );
   modal.appendChild(actions);
-
-  backdrop.appendChild(modal);
-  backdrop.addEventListener("click", (e) => {
-    if (e.target === backdrop) closeModal();
-  });
   modalRoot.appendChild(backdrop);
 }
 
-/** 新しい世界の生成設定 */
+function promptModal(title: string, initial: string, onOk: (value: string) => void) {
+  const { backdrop, modal, actions } = modalShell(title);
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "search-input";
+  input.value = initial;
+  input.maxLength = 24;
+  modal.appendChild(input);
+  const submit = () => {
+    const value = input.value;
+    closeModal();
+    onOk(value);
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submit();
+  });
+  actions.appendChild(actionButton("キャンセル", "btn", closeModal));
+  actions.appendChild(actionButton("変更", "btn btn--primary", submit));
+  modal.appendChild(actions);
+  modalRoot.appendChild(backdrop);
+  window.setTimeout(() => {
+    input.focus();
+    input.select();
+  }, 30);
+}
+
 function openNewWorldModal() {
-  const backdrop = document.createElement("div");
-  backdrop.className = "modal-backdrop";
-  const modal = document.createElement("div");
-  modal.className = "modal";
-  modal.appendChild(headingEl("新しい世界を生成"));
+  const { backdrop, modal, actions } = modalShell("新しい世界を生成");
 
   const sizes: [string, number, number][] = [
-    ["小さな島 (40×26)", 40, 26],
-    ["標準 (52×34)", 52, 34],
-    ["大陸 (68×44)", 68, 44]
+    ["小さな島々 (56×36)", 56, 36],
+    ["標準 (72×46)", 72, 46],
+    ["広大な大陸 (96×60)", 96, 60]
   ];
   let sizeIndex = 1;
-  let nationCount = 7;
+  let nationCount = 9;
+  let landRatio = 0.55;
   let seedText = String(Math.floor(Math.random() * 2 ** 31));
 
   const sizeRow = document.createElement("div");
   sizeRow.className = "settings-row";
-  sizeRow.appendChild(document.createTextNode("世界の大きさ"));
+  sizeRow.appendChild(document.createTextNode("世界の広さ"));
   const sizeSelect = document.createElement("select");
   sizeSelect.className = "select";
   sizes.forEach(([label], i) => {
@@ -702,22 +725,45 @@ function openNewWorldModal() {
   sizeRow.appendChild(sizeSelect);
   modal.appendChild(sizeRow);
 
+  const landRow = document.createElement("div");
+  landRow.className = "settings-row";
+  const landLabel = document.createElement("span");
+  landLabel.textContent = `陸地の割合 ${Math.round(landRatio * 100)}%`;
+  const landInput = document.createElement("input");
+  landInput.type = "range";
+  landInput.min = "30";
+  landInput.max = "80";
+  landInput.value = String(landRatio * 100);
+  landInput.className = "range";
+  landInput.addEventListener("input", () => {
+    landRatio = Number(landInput.value) / 100;
+    landLabel.textContent = `陸地の割合 ${landInput.value}%`;
+  });
+  landRow.appendChild(landLabel);
+  landRow.appendChild(landInput);
+  modal.appendChild(landRow);
+
   const countRow = document.createElement("div");
   countRow.className = "settings-row";
-  countRow.appendChild(document.createTextNode("初期の国家数"));
+  const countLabel = document.createElement("span");
+  countLabel.textContent = `初期国家数 ${nationCount}`;
   const countInput = document.createElement("input");
-  countInput.type = "number";
-  countInput.className = "select";
+  countInput.type = "range";
   countInput.min = "2";
-  countInput.max = "14";
-  countInput.value = "7";
-  countInput.addEventListener("change", () => (nationCount = Number(countInput.value)));
+  countInput.max = "18";
+  countInput.value = String(nationCount);
+  countInput.className = "range";
+  countInput.addEventListener("input", () => {
+    nationCount = Number(countInput.value);
+    countLabel.textContent = `初期国家数 ${nationCount}`;
+  });
+  countRow.appendChild(countLabel);
   countRow.appendChild(countInput);
   modal.appendChild(countRow);
 
   const seedRow = document.createElement("div");
   seedRow.className = "settings-row";
-  seedRow.appendChild(document.createTextNode("シード値"));
+  seedRow.appendChild(document.createTextNode("シード"));
   const seedInput = document.createElement("input");
   seedInput.type = "text";
   seedInput.className = "select";
@@ -726,40 +772,22 @@ function openNewWorldModal() {
   seedRow.appendChild(seedInput);
   modal.appendChild(seedRow);
 
-  const hint = document.createElement("div");
-  hint.className = "card__meta";
-  hint.style.marginTop = "10px";
-  hint.textContent = "同じシード値を入れると、まったく同じ地形の世界が再生成されます。";
-  modal.appendChild(hint);
-
-  const actions = document.createElement("div");
-  actions.className = "modal-actions";
-  const cancel = document.createElement("button");
-  cancel.className = "btn";
-  cancel.textContent = "キャンセル";
-  cancel.addEventListener("click", closeModal);
-  const ok = document.createElement("button");
-  ok.className = "btn btn--primary";
-  ok.textContent = "生成する";
-  ok.addEventListener("click", () => {
-    closeModal();
-    const [, width, height] = sizes[sizeIndex];
-    const parsed = Number(seedText);
-    startNewWorld({
-      width,
-      height,
-      nationCount: Math.max(2, Math.min(14, nationCount)),
-      seed: Number.isFinite(parsed) ? Math.floor(parsed) : hashString(seedText)
-    });
-  });
-  actions.appendChild(cancel);
-  actions.appendChild(ok);
+  actions.appendChild(actionButton("キャンセル", "btn", closeModal));
+  actions.appendChild(
+    actionButton("生成する", "btn btn--primary", () => {
+      closeModal();
+      const [, width, height] = sizes[sizeIndex];
+      const parsed = Number(seedText);
+      startNewWorld({
+        width,
+        height,
+        nationCount,
+        landRatio,
+        seed: Number.isFinite(parsed) && seedText.trim() !== "" ? Math.floor(parsed) : hashString(seedText)
+      });
+    })
+  );
   modal.appendChild(actions);
-
-  backdrop.appendChild(modal);
-  backdrop.addEventListener("click", (e) => {
-    if (e.target === backdrop) closeModal();
-  });
   modalRoot.appendChild(backdrop);
 }
 
@@ -772,40 +800,28 @@ function hashString(text: string): number {
   return h >>> 0;
 }
 
-function headingEl(text: string): HTMLElement {
-  const h = document.createElement("h2");
-  h.textContent = text;
-  return h;
-}
-
 function closeModal() {
   modalRoot.innerHTML = "";
 }
 
 // ==============================================================
-// 年送り / 自動進行
+// 年送り
 // ==============================================================
 function advanceYear(fromAuto = false) {
   const events = world.tick();
+  lastTickAt = performance.now();
+  renderer.invalidate();
 
-  for (const e of events.filter((ev) => ev.importance >= 2).slice(0, 2)) {
-    showToast(e.text, "major");
-  }
+  for (const e of events.filter((ev) => ev.importance >= 2).slice(0, 2)) showToast(e.text, "major");
 
   ticksSinceSave += 1;
-  ticksSincePanel += 1;
-
-  // 高速進行中はセーブとパネル再描画を間引いて軽くする
-  const panelInterval = fromAuto && speedIndex === 2 ? 3 : 1;
-  const panels = ticksSincePanel >= panelInterval;
-  if (panels) ticksSincePanel = 0;
-
   if (!fromAuto || ticksSinceSave >= 5) {
     saveWorld();
     ticksSinceSave = 0;
   }
 
-  refreshAll(panels);
+  refreshHud();
+  if (!fromAuto || speedIndex <= 1 || world.year % 3 === 0) renderActiveTab();
 }
 
 function toggleAutoPlay() {
@@ -815,6 +831,7 @@ function toggleAutoPlay() {
     autoTimer = null;
   }
   if (autoPlay) {
+    lastTickAt = performance.now();
     autoTimer = window.setInterval(() => advanceYear(true), SPEEDS[speedIndex].interval);
   } else {
     saveWorld();
@@ -835,15 +852,22 @@ function renderSpeedGroup() {
   const group = document.getElementById("speed-group")!;
   group.innerHTML = "";
 
+  const step = document.createElement("button");
+  step.className = "hud-btn";
+  step.textContent = "▸|";
+  step.title = "1年進める";
+  step.addEventListener("click", () => advanceYear());
+  group.appendChild(step);
+
   const playBtn = document.createElement("button");
-  playBtn.className = "btn" + (autoPlay ? " btn--gold" : "");
-  playBtn.textContent = autoPlay ? "⏸ 停止" : "▶ 自動";
+  playBtn.className = "hud-btn" + (autoPlay ? " hud-btn--active" : "");
+  playBtn.textContent = autoPlay ? "❚❚" : "▶";
   playBtn.addEventListener("click", toggleAutoPlay);
   group.appendChild(playBtn);
 
   SPEEDS.forEach((speed, i) => {
     const btn = document.createElement("button");
-    btn.className = "btn btn--icon" + (speedIndex === i ? " btn--gold" : "");
+    btn.className = "hud-btn hud-btn--small" + (speedIndex === i ? " hud-btn--active" : "");
     btn.textContent = speed.label;
     btn.addEventListener("click", () => setSpeed(i));
     group.appendChild(btn);
@@ -857,13 +881,45 @@ function startNewWorld(config?: Partial<WorldConfig>) {
   chat = new ChatController(world);
   selectedNationId = null;
   selectedPersonId = null;
-  peopleFilter = "all";
+  peopleNationFilter = "all";
   historyKeyword = "";
   historyCategory = "all";
   tileInspector.style.display = "none";
   saveWorld();
   refreshAll();
   showToast("新しい世界が生まれました");
+}
+
+// ==============================================================
+// パネル / タブ
+// ==============================================================
+function renderTabs() {
+  const nav = document.getElementById("panel-tabs")!;
+  nav.innerHTML = "";
+  for (const tab of TABS) {
+    const btn = document.createElement("button");
+    btn.className = "panel-tab" + (activeTab === tab.id ? " active" : "");
+    btn.dataset.tab = tab.id;
+    btn.innerHTML = `<span class="panel-tab__icon">${tab.icon}</span><span class="panel-tab__label">${tab.label}</span>`;
+    btn.addEventListener("click", () => {
+      if (activeTab === tab.id && panelOpen) {
+        openPanel(false);
+        return;
+      }
+      activeTab = tab.id;
+      openPanel(true);
+      renderTabs();
+      renderActiveTab();
+    });
+    nav.appendChild(btn);
+  }
+}
+
+function openPanel(open: boolean) {
+  panelOpen = open;
+  panel.classList.toggle("panel--open", open);
+  app.classList.toggle("panel-open", open);
+  document.getElementById("btn-panel")!.classList.toggle("hud-btn--active", open);
 }
 
 // ==============================================================
@@ -874,12 +930,12 @@ function renderMapModes() {
   container.innerHTML = "";
   (Object.keys(MAP_MODE_LABEL) as MapMode[]).forEach((mode) => {
     const btn = document.createElement("button");
-    btn.className = "chip" + (renderer.mode === mode ? " chip--active" : "");
+    btn.className = "mode-chip" + (renderer.mode === mode ? " mode-chip--active" : "");
     btn.textContent = MAP_MODE_LABEL[mode];
     btn.addEventListener("click", () => {
       renderer.mode = mode;
+      renderer.invalidate();
       renderMapModes();
-      refreshAll(false);
     });
     container.appendChild(btn);
   });
@@ -888,28 +944,21 @@ function renderMapModes() {
 // ==============================================================
 // タイル情報
 // ==============================================================
-const TERRAIN_LABEL: Record<string, string> = {
-  ocean: "海",
-  plains: "平野",
-  forest: "森林",
-  mountain: "山岳",
-  desert: "砂漠",
-  tundra: "凍土"
-};
-
 function showTileInfo(clientX: number, clientY: number) {
   const tile = renderer.tileAt(clientX, clientY);
   if (!tile) {
     tileInspector.style.display = "none";
     return;
   }
-
   const nation = world.getNation(tile.ownerId);
   const city = tile.cityId ? world.getCity(tile.cityId) : undefined;
+  const army = renderer.armyAt(clientX, clientY);
+
   const lines = [
-    `(${tile.x}, ${tile.y}) ${TERRAIN_LABEL[tile.terrain] ?? tile.terrain}`,
-    nation ? `${nation.name}領` : "無主の地",
+    `${TERRAIN_LABEL[tile.terrain]}${tile.river ? " ・ 川" : ""} (${tile.x},${tile.y})`,
+    nation ? `<b style="color:${nation.color}">${nation.name}</b>領` : "無主の地",
     city ? `${city.isCapital ? "★" : "◍"} ${city.name} 人口${city.population.toLocaleString()}` : "",
+    army ? `⚔ ${world.getNation(army.nationId)?.name ?? ""} ${army.name} 兵${army.strength}` : "",
     tile.resource ? `資源: ${RESOURCE_LABEL[tile.resource]}` : "",
     `肥沃度 ${Math.round(tile.fertility * 100)}`
   ].filter(Boolean);
@@ -919,31 +968,18 @@ function showTileInfo(clientX: number, clientY: number) {
 }
 
 // ==============================================================
-// イベント結線
+// 入力
 // ==============================================================
-document.getElementById("btn-next-year")!.addEventListener("click", () => advanceYear());
-document.getElementById("btn-new-world")!.addEventListener("click", openNewWorldModal);
-document.getElementById("btn-zoom-in")!.addEventListener("click", () => {
-  renderer.zoomBy(1.35);
-  refreshAll(false);
-});
-document.getElementById("btn-zoom-out")!.addEventListener("click", () => {
-  renderer.zoomBy(1 / 1.35);
-  refreshAll(false);
-});
-document.getElementById("btn-zoom-reset")!.addEventListener("click", () => {
-  renderer.resetView();
-  refreshAll(false);
+document.getElementById("btn-panel")!.addEventListener("click", () => openPanel(!panelOpen));
+document.getElementById("panel-handle")!.addEventListener("click", () => openPanel(!panelOpen));
+document.getElementById("btn-zoom-in")!.addEventListener("click", () => renderer.zoomBy(1.4));
+document.getElementById("btn-zoom-out")!.addEventListener("click", () => renderer.zoomBy(1 / 1.4));
+document.getElementById("btn-zoom-reset")!.addEventListener("click", () => renderer.resetView());
+document.getElementById("btn-labels")!.addEventListener("click", (e) => {
+  renderer.showLabels = !renderer.showLabels;
+  (e.currentTarget as HTMLElement).classList.toggle("hud-btn--active", renderer.showLabels);
 });
 
-document.querySelectorAll<HTMLButtonElement>(".tab").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    activeTab = btn.dataset.tab as TabId;
-    refreshAll();
-  });
-});
-
-// --- 地図の操作 (ドラッグ / ホイール / ピンチ) ---
 const pointers = new Map<number, { x: number; y: number }>();
 let dragged = false;
 let pinchDistance = 0;
@@ -966,10 +1002,7 @@ canvas.addEventListener("pointermove", (e) => {
   if (pointers.size === 2) {
     const [a, b] = [...pointers.values()];
     const dist = Math.hypot(a.x - b.x, a.y - b.y);
-    if (pinchDistance > 0) {
-      renderer.zoomBy(dist / pinchDistance, (a.x + b.x) / 2, (a.y + b.y) / 2);
-      refreshAll(false);
-    }
+    if (pinchDistance > 0) renderer.zoomBy(dist / pinchDistance, (a.x + b.x) / 2, (a.y + b.y) / 2);
     pinchDistance = dist;
     dragged = true;
     return;
@@ -980,7 +1013,6 @@ canvas.addEventListener("pointermove", (e) => {
   if (Math.abs(dx) + Math.abs(dy) > 2) {
     dragged = true;
     renderer.panBy(dx, dy);
-    refreshAll(false);
   }
 });
 
@@ -988,13 +1020,19 @@ function endPointer(e: PointerEvent) {
   pointers.delete(e.pointerId);
   if (pointers.size < 2) pinchDistance = 0;
 }
+
 canvas.addEventListener("pointerup", (e) => {
   endPointer(e);
   if (dragged) return;
   showTileInfo(e.clientX, e.clientY);
   const ownerId = renderer.hitTest(e.clientX, e.clientY);
-  if (ownerId) selectNation(ownerId);
-  else refreshAll(false);
+  if (ownerId) {
+    selectedNationId = ownerId;
+    activeTab = "nations";
+    renderTabs();
+    renderActiveTab();
+    refreshHud();
+  }
 });
 canvas.addEventListener("pointercancel", endPointer);
 canvas.addEventListener("pointerleave", endPointer);
@@ -1003,16 +1041,14 @@ canvas.addEventListener(
   "wheel",
   (e) => {
     e.preventDefault();
-    renderer.zoomBy(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX, e.clientY);
-    refreshAll(false);
+    renderer.zoomBy(e.deltaY < 0 ? 1.16 : 1 / 1.16, e.clientX, e.clientY);
   },
   { passive: false }
 );
 
-// --- キーボードショートカット ---
 window.addEventListener("keydown", (e) => {
   const target = e.target as HTMLElement | null;
-  if (target && (target.tagName === "INPUT" || target.tagName === "SELECT" || target.tagName === "TEXTAREA")) return;
+  if (target && ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName)) return;
 
   switch (e.key) {
     case " ":
@@ -1023,51 +1059,47 @@ window.addEventListener("keydown", (e) => {
     case "A":
       toggleAutoPlay();
       break;
+    case "Tab":
+      e.preventDefault();
+      openPanel(!panelOpen);
+      break;
     case "+":
     case "=":
-      renderer.zoomBy(1.35);
-      refreshAll(false);
+      renderer.zoomBy(1.4);
       break;
     case "-":
-      renderer.zoomBy(1 / 1.35);
-      refreshAll(false);
+      renderer.zoomBy(1 / 1.4);
       break;
     case "0":
       renderer.resetView();
-      refreshAll(false);
       break;
-    case "1":
-    case "2":
-    case "3":
-    case "4":
-    case "5": {
-      const modes = Object.keys(MAP_MODE_LABEL) as MapMode[];
-      const mode = modes[Number(e.key) - 1];
-      if (mode) {
-        renderer.mode = mode;
-        renderMapModes();
-        refreshAll(false);
+    default: {
+      const n = Number(e.key);
+      if (n >= 1 && n <= 6) {
+        const modes = Object.keys(MAP_MODE_LABEL) as MapMode[];
+        const mode = modes[n - 1];
+        if (mode) {
+          renderer.mode = mode;
+          renderer.invalidate();
+          renderMapModes();
+        }
       }
-      break;
     }
   }
 });
 
-window.addEventListener("resize", () => refreshAll(false));
 window.addEventListener("beforeunload", saveWorld);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") saveWorld();
-});
-
-aiService.onProgress((p) => {
-  const el = document.getElementById("ai-status-text");
-  if (el) el.textContent = p.message;
 });
 
 // ==============================================================
 // 初期化
 // ==============================================================
 setupPWA();
+renderTabs();
 renderSpeedGroup();
 renderMapModes();
+openPanel(panelOpen);
 refreshAll();
+requestAnimationFrame(frame);

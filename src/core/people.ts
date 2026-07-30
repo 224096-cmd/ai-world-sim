@@ -1,6 +1,6 @@
 import { Rng } from "./rng";
 import { NameGenerator } from "./nameGenerator";
-import { Gender, Nation, Person, PersonRole } from "./types";
+import { COURT_ROLES, Gender, Nation, Person, PersonRole } from "./types";
 import { nextId } from "./ids";
 
 function randomTraits(rng: Rng, bias = 0) {
@@ -58,6 +58,7 @@ export function createPerson(
     gender,
     dynasty,
     parentId: opts.parent?.id ?? null,
+    loyalty: rng.int(45, 95),
     traits: opts.parent ? inheritTraits(opts.parent, rng) : randomTraits(rng, opts.traitBias ?? 0),
     alive: true,
     bornYear: currentYear - age,
@@ -100,11 +101,9 @@ export function spawnCourt(
     parent: king
   });
 
-  const general = createPerson(nation, "general", names, rng, currentYear);
-  const merchant = createPerson(nation, "merchant", names, rng, currentYear);
-  const scholar = createPerson(nation, "scholar", names, rng, currentYear);
+  const court = COURT_ROLES.map((role) => createPerson(nation, role, names, rng, currentYear));
 
-  return [king, heir, general, merchant, scholar];
+  return [king, heir, ...court];
 }
 
 /** 役職の代表者(最も能力の高い生存者)を返す */

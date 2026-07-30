@@ -35,7 +35,7 @@ const CULTURES: Culture[] = [
     maleGiven: ["ハラルド", "スヴェン", "エイリーク", "ビョルン", "オラフ", "クヌート"],
     femaleGiven: ["アストリッド", "フレイヤ", "シグリッド", "イングリッド", "ヘルガ"],
     surname: ["ウルフソン", "ビョルンダル", "ラグナルセン", "ソルヴァルド"],
-    title: { king: "王", heir: "王子", general: "戦将", merchant: "商団長", scholar: "賢人" }
+    title: { king: "王", heir: "王子", general: "戦将", merchant: "商団長", scholar: "賢人", spy: "影の者", priest: "神官", diplomat: "使節" }
   },
   {
     id: "desert",
@@ -48,7 +48,7 @@ const CULTURES: Culture[] = [
     maleGiven: ["ヤシル", "ハキム", "オマール", "タリク", "ラシード", "ジャミル"],
     femaleGiven: ["ライラ", "ナディア", "ヤスミン", "アミラ", "サフィヤ"],
     surname: ["イブン=ハリド", "アル=ファーリス", "ベン=ラシード", "アル=ハキム"],
-    title: { king: "スルタン", heir: "王太子", general: "将軍", merchant: "隊商主", scholar: "学匠" }
+    title: { king: "スルタン", heir: "王太子", general: "将軍", merchant: "隊商主", scholar: "学匠", spy: "隠密", priest: "導師", diplomat: "特使" }
   },
   {
     id: "forest",
@@ -61,7 +61,7 @@ const CULTURES: Culture[] = [
     maleGiven: ["エルロン", "シルヴァン", "ケイン", "アーヴィン", "ローワン"],
     femaleGiven: ["リアンナ", "エスメ", "セレネ", "フィオナ", "ブライア"],
     surname: ["リーフウォーカー", "グリーンウッド", "フェアハート", "モスバーン"],
-    title: { king: "森王", heir: "若枝", general: "守護将", merchant: "行商頭", scholar: "森の賢者" }
+    title: { king: "森王", heir: "若枝", general: "守護将", merchant: "行商頭", scholar: "森の賢者", spy: "囁き手", priest: "巫", diplomat: "伝令" }
   },
   {
     id: "imperial",
@@ -74,7 +74,7 @@ const CULTURES: Culture[] = [
     maleGiven: ["マルクス", "アウグスト", "セルギウス", "クラウディウス", "ティトゥス"],
     femaleGiven: ["リヴィア", "オクタヴィア", "コルネリア", "ユリア", "アウレリア"],
     surname: ["ヴァレリウス", "コルネリウス", "アントニヌス", "セウェルス"],
-    title: { king: "皇帝", heir: "皇太子", general: "軍団長", merchant: "元老商", scholar: "碩学" }
+    title: { king: "皇帝", heir: "皇太子", general: "軍団長", merchant: "元老商", scholar: "碩学", spy: "密偵長", priest: "大祭司", diplomat: "大使" }
   },
   {
     id: "eastern",
@@ -87,7 +87,7 @@ const CULTURES: Culture[] = [
     maleGiven: ["景", "泰然", "遼", "武文", "玄", "伯陽"],
     femaleGiven: ["麗華", "静姫", "美凰", "雪蓮", "琳"],
     surname: ["高", "李", "王", "趙", "陳", "楊"],
-    title: { king: "皇", heir: "太子", general: "大将軍", merchant: "豪商", scholar: "宰相" }
+    title: { king: "皇", heir: "太子", general: "大将軍", merchant: "豪商", scholar: "宰相", spy: "間者", priest: "祭酒", diplomat: "使臣" }
   }
 ];
 
