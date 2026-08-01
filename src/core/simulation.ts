@@ -1,1707 +1,2166 @@
 import { Rng } from "./rng";
-import { NameGenerator } from "./nameGenerator";
+import { generateMap } from "./worldgen";
+import { Culture, cultureById, NameGenerator, NATION_COLORS } from "./nameGenerator";
 import {
   Army,
-  BattleMark,
   City,
-  COURT_ROLES,
-  GodInterventionLog,
-  Migration,
+  EventCategory,
+  Fx,
   Nation,
   Person,
-  PersonRole,
-  RESOURCE_LABEL,
-  ResourceType,
-  StatPoint,
+  Relation,
+  RelationStatus,
+  ToolId,
+  Unit,
   WorldConfig,
-  WorldEvent
+  WorldEvent,
+  R,
+  T,
+  isLand,
+  isPassable,
+  isWater
 } from "./types";
-import { generateWorld, WorldMap, findLandTile, isCoast, tileKey } from "./worldgen";
-import {
-  areAdjacent,
-  carveRegion,
-  computeAdjacency,
-  createNation,
-  expandTerritory,
-  pickColor,
-  powerScore,
-  relationOf,
-  spawnNations,
-  transferTile
-} from "./nations";
-import { armySteps, battlePower, createArmy, stepArmy } from "./armies";
-import { bestOfRole, createHeir, createPerson, spawnCourt } from "./people";
-import { attachCity, cityIncome, createCity, findCitySite, updateCities } from "./cities";
-import { generateTemplateEvent, makeAiEvent } from "./events";
-import { getIdCounters, IdCounters, nextId, resetIdCounters, setIdCounters } from "./ids";
 
-const START_YEAR = 1;
-export const SNAPSHOT_VERSION = 3;
+// ============================================================
+// 世界シミュレーション本体
+// 1 tick = 1ヶ月。国家の拡張・経済・外交・戦争・人物・住民ユニット・
+// 神の介入(WorldBox風ツール)をすべてここで処理する。
+// ============================================================
 
-const MAX_EVENTS = 520;
-const MAX_PEOPLE_RECORDS = 520;
-const MAX_MARKS = 60;
-const MAX_NATIONS = 30;
-const STAT_INTERVAL = 5;
-const MAX_STATS = 140;
+export const SNAPSHOT_VERSION = 2;
 
-export interface WorldSnapshot {
-  version: number;
-  config: WorldConfig;
-  year: number;
-  faith: number;
-  counters: IdCounters;
-  nations: (Omit<Nation, "territory"> & { territory: string[] })[];
-  people: Person[];
-  cities: City[];
-  armies: Army[];
-  events: WorldEvent[];
-  battles: BattleMark[];
-  migrations: Migration[];
-  godLog: GodInterventionLog[];
+export interface Tornado {
+  x: number;
+  y: number;
+  px: number;
+  py: number;
+  dir: number;
+  ttl: number;
 }
 
-export class GameWorld {
-  map: WorldMap;
+export interface Notification {
+  text: string;
+  kind: "info" | "war" | "divine" | "disaster";
+}
+
+export interface ToolResult {
+  ok: boolean;
+  msg?: string;
+}
+
+interface WorldStatPoint {
+  y: number;
+  pop: number;
+  nations: number;
+}
+
+const DIRS4 = [
+  [1, 0],
+  [-1, 0],
+  [0, 1],
+  [0, -1]
+] as const;
+
+const FLAMMABLE = new Set<number>([T.forest, T.jungle, T.savanna, T.plains, T.swamp]);
+
+export class World {
+  readonly config: WorldConfig;
+  readonly width: number;
+  readonly height: number;
+
+  // ---- タイルデータ (typed array) ----
+  terrain: Uint8Array;
+  elevation: Float32Array;
+  moisture: Float32Array;
+  fertility: Float32Array;
+  river: Uint8Array;
+  resource: Uint8Array;
+  owner: Int16Array; // nations配列のindex / -1
+  cityAt: Int16Array; // cities配列のindex / -1
+  burn: Uint8Array; // 残り燃焼月数
+
+  // ---- エンティティ ----
   nations: Nation[] = [];
-  people: Person[] = [];
   cities: City[] = [];
-  armies: Army[] = [];
+  people = new Map<string, Person>();
+  armies = new Map<string, Army>();
+  units: Unit[] = [];
+  tornadoes: Tornado[] = [];
+  fx: Fx[] = [];
   events: WorldEvent[] = [];
-  battles: BattleMark[] = [];
-  migrations: Migration[] = [];
-  godLog: GodInterventionLog[] = [];
-  year = START_YEAR;
-  faith = 30;
+  notifications: Notification[] = [];
+  worldStats: WorldStatPoint[] = [];
+
+  burningTiles = new Set<number>();
+
+  tick = 0;
   rng: Rng;
-  names: NameGenerator;
-  config: WorldConfig;
+  nameGen: NameGenerator;
 
-  private adjacency: Map<string, Set<string>> = new Map();
-  private pending: WorldEvent[] = [];
-  // ID -> 実体の索引。毎年の処理で何千回も参照するため線形探索を避ける
-  private nationById = new Map<string, Nation>();
-  private personById = new Map<string, Person>();
-  private cityById = new Map<string, City>();
-  private armyById = new Map<string, Army>();
+  needFullRepaint = true;
+  private dirty = new Set<number>();
 
-  private constructor(config: WorldConfig) {
+  private idCounter = 1;
+  private eventId = 1;
+  private nationIdxById = new Map<string, number>();
+  private borders = new Map<number, number[]>();
+  private contacts = new Map<number, { i: number; enemy: number }[]>();
+
+  // ------------------------------------------------------------
+  constructor(config: WorldConfig, skipInit = false) {
     this.config = config;
+    this.width = config.width;
+    this.height = config.height;
     this.rng = new Rng(config.seed);
-    this.names = new NameGenerator(this.rng);
-    this.map = generateWorld(config);
-  }
+    this.nameGen = new NameGenerator(this.rng);
 
-  static create(config: WorldConfig): GameWorld {
-    resetIdCounters();
-    const world = new GameWorld(config);
-    world.nations = spawnNations(world.map, config.nationCount, world.rng, world.names, START_YEAR);
-
-    for (const nation of world.nations) {
-      const court = spawnCourt(nation, world.names, world.rng, START_YEAR);
-      world.addPeople(court);
-      const king = court.find((p) => p.role === "king")!;
-
-      const capital = createCity(
-        nation,
-        nation.capital.x,
-        nation.capital.y,
-        world.names,
-        world.rng,
-        START_YEAR,
-        true
-      );
-      world.addCity(capital);
-      attachCity(nation, capital, world.map);
-      nation.capitalCityId = capital.id;
-
-      world.pushEvent(
-        generateTemplateEvent(
-          "founding",
-          "founding",
-          START_YEAR,
-          { nation: nation.name, king: king.name, capital: capital.name },
-          world.rng,
-          [nation.id],
-          [king.id],
-          2,
-          { x: capital.x, y: capital.y }
-        )
-      );
+    const size = this.width * this.height;
+    if (skipInit) {
+      this.terrain = new Uint8Array(size);
+      this.elevation = new Float32Array(size);
+      this.moisture = new Float32Array(size);
+      this.fertility = new Float32Array(size);
+      this.river = new Uint8Array(size);
+      this.resource = new Uint8Array(size);
+    } else {
+      const map = generateMap(this.width, this.height, config.seed, config.landRatio);
+      this.terrain = map.terrain;
+      this.elevation = map.elevation;
+      this.moisture = map.moisture;
+      this.fertility = map.fertility;
+      this.river = map.river;
+      this.resource = map.resource;
     }
+    this.owner = new Int16Array(size).fill(-1);
+    this.cityAt = new Int16Array(size).fill(-1);
+    this.burn = new Uint8Array(size);
 
-    world.adjacency = computeAdjacency(world.map);
-    world.reindex();
-    return world;
-  }
-
-  // ================= 参照ヘルパー =================
-  /** 配列から索引を作り直す (毎年の開始時とロード直後に実行) */
-  private reindex() {
-    this.nationById = new Map(this.nations.map((n) => [n.id, n]));
-    this.personById = new Map(this.people.map((p) => [p.id, p]));
-    this.cityById = new Map(this.cities.map((c) => [c.id, c]));
-    this.armyById = new Map(this.armies.map((a) => [a.id, a]));
+    if (!skipInit) {
+      this.spawnInitialNations(config.nationCount);
+      this.pushEvent("founding", 2, "神々の手により、新たな世界が生まれた。", []);
+    }
   }
 
-  private addNation(n: Nation) {
-    this.nations.push(n);
-    this.nationById.set(n.id, n);
+  // ---- 時刻 ----
+  get year(): number {
+    return Math.floor(this.tick / 12) + 1;
   }
-  private addPerson(p: Person) {
-    this.people.push(p);
-    this.personById.set(p.id, p);
-  }
-  private addPeople(list: Person[]) {
-    for (const p of list) this.addPerson(p);
-  }
-  private addCity(c: City) {
-    this.cities.push(c);
-    this.cityById.set(c.id, c);
-  }
-  private addArmy(a: Army) {
-    this.armies.push(a);
-    this.armyById.set(a.id, a);
+  get month(): number {
+    return this.tick % 12;
   }
 
-  getNation(id: string | null | undefined): Nation | undefined {
-    if (!id) return undefined;
-    return this.nationById.get(id) ?? this.nations.find((n) => n.id === id);
+  // ---- 座標ヘルパ ----
+  idx(x: number, y: number): number {
+    return y * this.width + x;
   }
-  getPerson(id: string | null | undefined): Person | undefined {
-    if (!id) return undefined;
-    return this.personById.get(id) ?? this.people.find((p) => p.id === id);
+  inBounds(x: number, y: number): boolean {
+    return x >= 0 && y >= 0 && x < this.width && y < this.height;
   }
-  getCity(id: string | null | undefined): City | undefined {
-    if (!id) return undefined;
-    return this.cityById.get(id) ?? this.cities.find((c) => c.id === id);
+  nationAtTile(x: number, y: number): Nation | null {
+    if (!this.inBounds(x, y)) return null;
+    const o = this.owner[this.idx(x, y)];
+    return o >= 0 ? this.nations[o] : null;
   }
-  getArmy(id: string | null | undefined): Army | undefined {
-    if (!id) return undefined;
-    return this.armyById.get(id) ?? this.armies.find((a) => a.id === id);
+  cityAtTile(x: number, y: number): City | null {
+    if (!this.inBounds(x, y)) return null;
+    const c = this.cityAt[this.idx(x, y)];
+    return c >= 0 ? this.cities[c] : null;
   }
-  /** 新しい国を作る余地があるか (巨大帝国の崩壊だけは上限を無視して起こる) */
-  canSpawnNation(force = false): boolean {
-    return this.livingNations().length < MAX_NATIONS + (force ? 6 : 0);
+  nationById(id: string | null | undefined): Nation | null {
+    if (!id) return null;
+    const i = this.nationIdxById.get(id);
+    return i === undefined ? null : this.nations[i];
   }
-  livingNations(): Nation[] {
+  cityById(id: string | null | undefined): City | null {
+    if (!id) return null;
+    return this.cities.find((c) => c.id === id) ?? null;
+  }
+  aliveNations(): Nation[] {
     return this.nations.filter((n) => n.alive);
   }
-  peopleOf(nationId: string): Person[] {
-    return this.people.filter((p) => p.nationId === nationId && p.alive);
-  }
-  citiesOf(nationId: string): City[] {
-    return this.cities.filter((c) => c.nationId === nationId);
-  }
-  armiesOf(nationId: string): Army[] {
-    return this.armies.filter((a) => a.nationId === nationId);
-  }
-  kingOf(nationId: string): Person | undefined {
-    return this.getPerson(this.getNation(nationId)?.kingId);
-  }
-  eventsOfNation(nationId: string, limit = 40): WorldEvent[] {
-    return this.events.filter((e) => e.nationIds.includes(nationId)).slice(-limit).reverse();
-  }
-  enemiesOf(nation: Nation): Nation[] {
-    return this.livingNations().filter((n) => nation.relations[n.id]?.status === "war");
-  }
-  isAtWar(nation: Nation): boolean {
-    return Object.values(nation.relations).some((r) => r.status === "war");
+  worldPopulation(): number {
+    let p = 0;
+    for (const n of this.nations) if (n.alive) p += n.population;
+    return p;
   }
 
-  private pushEvent(e: WorldEvent) {
-    this.events.push(e);
-    this.pending.push(e);
+  markDirty(i: number): void {
+    this.dirty.add(i);
+  }
+  /** 描画側が変更タイルを取り出す (取り出したら空になる) */
+  consumeDirty(): number[] {
+    if (this.dirty.size === 0) return [];
+    const arr = [...this.dirty];
+    this.dirty.clear();
+    return arr;
   }
 
-  private ev(
-    key: string,
-    category: WorldEvent["category"],
-    ctx: Record<string, string | number>,
-    nationIds: string[] = [],
-    personIds: string[] = [],
-    importance: 0 | 1 | 2 = 0,
-    pos?: { x: number; y: number }
-  ) {
-    this.pushEvent(
-      generateTemplateEvent(key, category, this.year, ctx, this.rng, nationIds, personIds, importance, pos)
-    );
+  private newId(prefix: string): string {
+    return `${prefix}${this.idCounter++}`;
   }
 
-  private mark(x: number, y: number, kind: BattleMark["kind"], attackerId: string, defenderId: string) {
-    this.battles.push({ x, y, year: this.year, kind, attackerId, defenderId });
-    if (this.battles.length > MAX_MARKS) this.battles.splice(0, this.battles.length - MAX_MARKS);
-  }
-
-  // ==========================================================
-  // メインループ
-  // ==========================================================
-  tick(): WorldEvent[] {
-    this.year += 1;
-    this.pending = [];
-    this.reindex();
-    this.adjacency = computeAdjacency(this.map);
-    this.syncCities();
-
-    for (const army of this.armies) {
-      army.prevX = army.x;
-      army.prevY = army.y;
+  // ============================================================
+  // 年代記
+  // ============================================================
+  pushEvent(
+    category: EventCategory,
+    importance: 0 | 1 | 2,
+    text: string,
+    nationIds: string[],
+    x?: number,
+    y?: number
+  ): void {
+    this.events.push({ id: this.eventId++, year: this.year, category, text, importance, nationIds, x, y });
+    if (this.events.length > 600) {
+      // 重要度の低いものから間引く
+      const minor = this.events.findIndex((e) => e.importance === 0);
+      if (minor >= 0) this.events.splice(minor, 1);
+      else this.events.shift();
     }
-
-    this.simulateEconomy();
-    this.simulateExpansion();
-    this.simulateDiplomacy();
-    this.simulateArmies();
-    this.simulateCities();
-    this.simulateSuccession();
-    this.simulateIntrigue();
-    this.simulateNature();
-    this.simulateTech();
-    this.simulateUnrest();
-    this.simulateAbsorption();
-    this.simulateEmergentNations();
-    this.checkNationFalls();
-    this.recordStats();
-
-    this.faith = Math.min(999, this.faith + this.faithRegen());
-    this.trimAll();
-    return this.pending;
-  }
-
-  faithRegen(): number {
-    const pop = this.livingNations().reduce((s, n) => s + n.population, 0);
-    return Math.round(3 + Math.min(9, pop / 40000));
-  }
-
-  spendFaith(cost: number): boolean {
-    if (this.faith < cost) return false;
-    this.faith -= cost;
-    return true;
-  }
-
-  // ---------------- 経済 ----------------
-  private foodCapacity(nation: Nation): number {
-    let fertility = 0;
-    for (const key of nation.territory) {
-      const [x, y] = key.split(",").map(Number);
-      const tile = this.map.tiles[y]?.[x];
-      if (tile) fertility += tile.fertility;
-    }
-    return Math.round(fertility * 2400 * (1 + nation.techLevel * 0.13));
-  }
-
-  private resourceIncome(nation: Nation): number {
-    let sum = 0;
-    for (const key of nation.territory) {
-      const [x, y] = key.split(",").map(Number);
-      const r = this.map.tiles[y]?.[x]?.resource;
-      if (!r) continue;
-      sum += r === "gold" || r === "gem" ? 6 : 3;
-    }
-    return sum * (1 + nation.techLevel * 0.05);
-  }
-
-  private tradeIncome(nation: Nation): number {
-    if (!nation.laws.tradeOpen) return 0;
-    let sum = 0;
-    for (const other of this.livingNations()) {
-      if (other.id === nation.id || !other.laws.tradeOpen) continue;
-      const rel = nation.relations[other.id];
-      if (!rel || rel.status === "war") continue;
-      if (!areAdjacent(this.adjacency, nation.id, other.id)) continue;
-      sum += (8 + Math.min(nation.techLevel, other.techLevel) * 4) * (rel.status === "alliance" ? 1.6 : 1);
-    }
-    if (this.hasPort(nation)) sum *= 1.3;
-    return sum;
-  }
-
-  private hasPort(nation: Nation): boolean {
-    for (const city of this.citiesOf(nation.id)) {
-      if (isCoast(this.map, city.x, city.y)) return true;
-    }
-    return false;
-  }
-
-  private simulateEconomy() {
-    for (const nation of this.livingNations()) {
-      const king = this.kingOf(nation.id);
-      const merchant = bestOfRole(this.peopleOf(nation.id), nation.id, "merchant", "wisdom");
-      const general = bestOfRole(this.peopleOf(nation.id), nation.id, "general", "wisdom");
-      const priest = bestOfRole(this.peopleOf(nation.id), nation.id, "priest", "charisma");
-
-      const capacity = Math.max(1, this.foodCapacity(nation));
-      const crowd = 1 - nation.population / capacity;
-      let growth = 0.02 * crowd * (0.55 + nation.stability / 120);
-      growth = clamp(growth, -0.06, 0.05);
-      nation.population = Math.max(0, Math.round(nation.population * (1 + growth)));
-
-      if (nation.population > capacity * 1.08 && this.rng.bool(0.2)) {
-        nation.population = Math.round(nation.population * 0.94);
-        nation.stability = Math.max(0, nation.stability - 5);
-        this.ev("overpopulation", "nature", { nation: nation.name }, [nation.id]);
-      }
-
-      const tradeSkill = 1 + (merchant?.traits.wisdom ?? 40) / 260;
-      const tax =
-        nation.population * nation.laws.taxRate * 0.035 * (1 + nation.techLevel * 0.08) * tradeSkill;
-      const income =
-        tax + cityIncome(nation, this.cities) + this.resourceIncome(nation) + this.tradeIncome(nation);
-      const upkeep =
-        nation.military * 0.12 * (nation.laws.militaryFocus ? 1.35 : 1) +
-        nation.cityIds.length * 6 +
-        nation.treasury * 0.03;
-
-      let net = income - upkeep;
-      if (nation.overlordId) {
-        const overlord = this.getNation(nation.overlordId);
-        const tribute = Math.round(Math.max(0, income) * 0.15);
-        if (overlord?.alive) overlord.treasury += tribute;
-        net -= tribute;
-      }
-      nation.treasury = Math.round(nation.treasury + net);
-
-      // 動員可能兵力
-      const genSkill = general ? general.traits.wisdom * 0.6 + general.traits.cruelty * 0.4 : 40;
-      let target =
-        (nation.population / 130) *
-        (0.6 + nation.techLevel * 0.09) *
-        (nation.laws.militaryFocus ? 1.5 : 1) *
-        (nation.laws.conscription ? 1.35 : 1) *
-        (1 + genSkill / 200);
-      if (nation.treasury < 0) {
-        target *= 0.75;
-        nation.treasury = 0;
-        nation.stability = Math.max(0, nation.stability - 2.5);
-      }
-      nation.military = Math.max(5, Math.round(nation.military + (target - nation.military) * 0.3));
-
-      // 安定度
-      let delta = 0.35;
-      delta += ((king?.traits.charisma ?? 50) - 50) / 40;
-      delta += (priest?.traits.charisma ?? 0) / 220;
-      delta -= (nation.laws.taxRate - 0.12) * 30;
-      delta -= nation.warExhaustion / 28;
-      delta -= nation.laws.conscription ? 0.5 : 0;
-      if ((king?.traits.cruelty ?? 30) > 70) delta -= 0.7;
-      if (nation.treasury > 400) delta += 0.4;
-      delta += nation.cityIds.length * 0.06;
-      delta -= Math.min(5, Math.max(0, nation.territory.size - 25) * 0.05);
-      delta += (nation.legitimacy - 60) / 120;
-      if (this.isAtWar(nation)) delta -= 0.8;
-      if (nation.overlordId) delta -= 0.35;
-      nation.stability = clamp(nation.stability + delta, 0, 100);
-      nation.legitimacy = clamp(nation.legitimacy + 0.4, 0, 100);
-
-      if (!this.isAtWar(nation)) nation.warExhaustion = Math.max(0, nation.warExhaustion - 1.5);
-
-      if (nation.stability > 88 && nation.treasury > 900 && this.rng.bool(0.02)) {
-        nation.techLevel = Math.min(12, nation.techLevel + 1);
-        this.ev("goldenAge", "economy", { nation: nation.name }, [nation.id], [], 1);
-      } else if (nation.stability < 22 && this.rng.bool(0.02)) {
-        this.ev("darkAge", "economy", { nation: nation.name }, [nation.id], [], 1);
-      }
-
-      if (priest && this.rng.bool(0.03)) {
-        nation.stability = Math.min(100, nation.stability + 4);
-        this.ev("festival", "economy", { nation: nation.name, priest: priest.name }, [nation.id], [priest.id]);
-      }
+    if (importance === 2) {
+      const kind: Notification["kind"] =
+        category === "war" ? "war" : category === "disaster" ? "disaster" : category === "divine" ? "divine" : "info";
+      this.notifications.push({ text: `${this.year}年 ${text}`, kind });
     }
   }
 
-  // ---------------- 拡張(入植) ----------------
-  private simulateExpansion() {
-    for (const nation of this.livingNations()) {
-      const king = this.kingOf(nation.id);
-      const pressure = nation.population / Math.max(1, nation.territory.size * 1500);
-      const chance = Math.min(0.85, 0.12 + pressure * 0.35 + (king?.traits.ambition ?? 50) / 450);
-      if (!this.rng.bool(chance)) continue;
-
-      const before = nation.territory.size;
-      const added = expandTerritory(nation, this.map, this.rng);
-      if (!added || nation.territory.size === before) continue;
-
-      const from = this.getCity(nation.capitalCityId);
-      const key = Array.from(nation.territory).pop()!;
-      const [tx, ty] = key.split(",").map(Number);
-      this.migrations.push({
-        fromX: from?.x ?? nation.capital.x,
-        fromY: from?.y ?? nation.capital.y,
-        toX: tx,
-        toY: ty,
-        nationId: nation.id,
-        year: this.year,
-        kind: "settle"
-      });
-      if (this.rng.bool(0.05)) {
-        this.ev("settlers", "city", { nation: nation.name }, [nation.id], [], 0, { x: tx, y: ty });
-      }
-    }
-  }
-
-  // ---------------- 外交 ----------------
-  private simulateDiplomacy() {
-    const nations = this.livingNations();
-
-    for (const a of nations) {
-      for (const b of nations) {
-        if (a.id >= b.id) continue;
-        if (!areAdjacent(this.adjacency, a.id, b.id)) continue;
-
-        const relA = relationOf(a, b.id);
-        const relB = relationOf(b, a.id);
-        if (relA.status === "war") continue;
-        if (relA.status === "truce") {
-          if ((relA.truceUntil ?? 0) <= this.year) {
-            relA.status = "peace";
-            relB.status = "peace";
-          } else {
-            continue;
-          }
-        }
-
-        const kingA = this.kingOf(a.id);
-        const kingB = this.kingOf(b.id);
-        const diplomatA = bestOfRole(this.peopleOf(a.id), a.id, "diplomat", "charisma");
-        const diplomatB = bestOfRole(this.peopleOf(b.id), b.id, "diplomat", "charisma");
-        const charisma = ((kingA?.traits.charisma ?? 50) + (kingB?.traits.charisma ?? 50)) / 2;
-        const powerA = powerScore(a);
-        const powerB = powerScore(b);
-
-        let drift = this.rng.range(-3.4, 2.4) + (charisma - 50) / 30;
-        drift += ((diplomatA?.traits.charisma ?? 0) + (diplomatB?.traits.charisma ?? 0)) / 160;
-        if (a.laws.tradeOpen && b.laws.tradeOpen) drift += 0.5;
-        if (a.laws.militaryFocus || b.laws.militaryFocus) drift -= 0.5;
-        drift -= Math.min(1.4, Math.abs(powerA - powerB) / 2200);
-        if (this.rng.bool(0.05)) drift -= this.rng.int(8, 22);
-        relA.score = clamp(relA.score + drift, -100, 100);
-        relB.score = relA.score;
-
-        const sameOverlord =
-          (a.overlordId && a.overlordId === b.overlordId) ||
-          a.overlordId === b.id ||
-          b.overlordId === a.id;
-
-        if (relA.score < -45 && relA.status === "peace" && !sameOverlord) {
-          const ambition = ((kingA?.traits.ambition ?? 50) + (kingB?.traits.ambition ?? 50)) / 2;
-          const ratio = powerA / Math.max(1, powerB);
-          if ((ratio > 0.7 || ratio < 1 / 0.7) && this.rng.bool(0.08 + ambition / 700)) {
-            this.declareWar(ratio >= 1 ? a : b, ratio >= 1 ? b : a);
-            continue;
-          }
-        }
-
-        if (relA.status === "peace" && !sameOverlord) {
-          const strong = powerA >= powerB ? a : b;
-          const weak = strong === a ? b : a;
-          const ratio = Math.max(powerA, powerB) / Math.max(1, Math.min(powerA, powerB));
-          const amb = (strong === a ? kingA : kingB)?.traits.ambition ?? 50;
-          if (ratio > 1.6 && amb > 60 && this.rng.bool(0.015 + (amb - 60) / 1200)) {
-            this.declareWar(strong, weak);
-            continue;
-          }
-        }
-
-        if (relA.score > 70 && relA.status === "peace" && this.rng.bool(0.06)) {
-          relA.status = "alliance";
-          relB.status = "alliance";
-          relA.since = this.year;
-          relB.since = this.year;
-          this.ev("allianceFormed", "diplomacy", { nation: a.name, enemy: b.name }, [a.id, b.id], [], 1);
-        } else if (relA.status === "alliance" && relA.score < -10) {
-          relA.status = "peace";
-          relB.status = "peace";
-          this.ev("allianceBroken", "diplomacy", { nation: a.name, enemy: b.name }, [a.id, b.id], [], 1);
-        } else if (relA.score > 55 && this.rng.bool(0.03)) {
-          relA.score = clamp(relA.score + 12, -100, 100);
-          relB.score = relA.score;
-          this.ev("royalMarriage", "diplomacy", { nation: a.name, enemy: b.name }, [a.id, b.id], [], 1);
-        } else if (diplomatA && relA.score < 0 && this.rng.bool(0.05)) {
-          relA.score = clamp(relA.score + 14, -100, 100);
-          relB.score = relA.score;
-          this.ev("treaty", "diplomacy", { nation: a.name, enemy: b.name, diplomat: diplomatA.name }, [a.id, b.id], [diplomatA.id]);
-        } else if (relA.status === "peace" && relA.score > 20 && this.rng.bool(0.03)) {
-          const merchant = bestOfRole(this.peopleOf(a.id), a.id, "merchant", "wisdom");
-          this.ev("tradeRoute", "economy", { nation: a.name, enemy: b.name, merchant: merchant?.name ?? a.name }, [a.id, b.id], merchant ? [merchant.id] : []);
+  // ============================================================
+  // 初期国家の配置
+  // ============================================================
+  private spawnInitialNations(count: number): void {
+    type Cand = { x: number; y: number; score: number };
+    const cands: Cand[] = [];
+    for (let n = 0; n < 900; n++) {
+      const x = this.rng.int(3, this.width - 4);
+      const y = this.rng.int(3, this.height - 4);
+      const i = this.idx(x, y);
+      if (!isPassable(this.terrain[i])) continue;
+      let score = 0;
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (!this.inBounds(nx, ny)) continue;
+          const j = this.idx(nx, ny);
+          score += this.fertility[j];
+          if (isWater(this.terrain[j])) score += 0.08;
+          if (this.river[j]) score += 0.1;
         }
       }
+      cands.push({ x, y, score });
+    }
+    cands.sort((a, b) => b.score - a.score);
+    const minDist = Math.max(9, Math.min(this.width, this.height) / (Math.ceil(Math.sqrt(count)) + 1.2));
+    const chosen: Cand[] = [];
+    for (const c of cands) {
+      if (chosen.length >= count) break;
+      if (chosen.every((o) => Math.hypot(o.x - c.x, o.y - c.y) >= minDist)) chosen.push(c);
+    }
+    for (const c of chosen) {
+      this.foundNation(c.x, c.y, { pop: this.rng.int(1200, 2200), radius: 2, silent: true });
     }
   }
 
-  private declareWar(a: Nation, b: Nation) {
-    const relA = relationOf(a, b.id);
-    const relB = relationOf(b, a.id);
-    relA.status = "war";
-    relB.status = "war";
-    relA.since = this.year;
-    relB.since = this.year;
-    const king = this.kingOf(a.id);
-    this.ev("warDeclared", "war", { nation: a.name, enemy: b.name, king: king?.name ?? a.name }, [a.id, b.id], king ? [king.id] : [], 2);
-
-    for (const ally of this.livingNations()) {
-      if (ally.id === a.id || ally.id === b.id) continue;
-      if (b.relations[ally.id]?.status !== "alliance") continue;
-      const r1 = relationOf(ally, a.id);
-      const r2 = relationOf(a, ally.id);
-      if (r1.status === "war") continue;
-      r1.status = "war";
-      r2.status = "war";
-      r1.score = -60;
-      r2.score = -60;
-      this.ev("warDeclared", "war", { nation: ally.name, enemy: a.name, king: this.kingOf(ally.id)?.name ?? ally.name }, [ally.id, a.id], [], 2);
+  // ============================================================
+  // 国家・都市・人物の生成
+  // ============================================================
+  private climateAt(x: number, y: number): "cold" | "hot" | "wet" | "temperate" | "coastal" {
+    const t = this.terrain[this.idx(x, y)];
+    if (t === T.snow || t === T.tundra) return "cold";
+    if (t === T.desert || t === T.savanna) return "hot";
+    if (t === T.jungle || t === T.swamp) return "wet";
+    for (const [dx, dy] of DIRS4) {
+      if (this.inBounds(x + dx, y + dy) && isWater(this.terrain[this.idx(x + dx, y + dy)])) return "coastal";
     }
+    return "temperate";
   }
 
-  // ==========================================================
-  // 軍団: 編成 -> 進軍 -> 会戦 -> 攻城 -> 占領
-  // ==========================================================
-  private simulateArmies() {
-    this.armies = this.armies.filter((a) => this.getNation(a.nationId)?.alive);
-
-    for (const nation of this.livingNations()) {
-      const own = this.armiesOf(nation.id);
-      nation.armyIds = own.map((a) => a.id);
-
-      if (this.isAtWar(nation)) {
-        const maxArmies = Math.min(4, 1 + Math.floor(nation.military / 420));
-        if (own.length < maxArmies && nation.treasury > 60) {
-          const general = bestOfRole(this.peopleOf(nation.id), nation.id, "general", "wisdom");
-          const capital = this.getCity(nation.capitalCityId);
-          const army = createArmy(
-            nation,
-            capital?.x ?? nation.capital.x,
-            capital?.y ?? nation.capital.y,
-            nation.military * 0.35,
-            general?.id ?? null,
-            own.length + 1
-          );
-          this.addArmy(army);
-          nation.armyIds.push(army.id);
-          nation.treasury -= 50;
-          this.ev("armyRaised", "war", { nation: nation.name, army: army.name, general: general?.name ?? "無名の将" }, [nation.id], general ? [general.id] : [], 0, { x: army.x, y: army.y });
-        }
-      }
-    }
-
-    for (const army of [...this.armies]) {
-      const nation = this.getNation(army.nationId);
-      if (!nation?.alive) continue;
-      this.assignArmyTarget(army, nation);
-
-      const steps = armySteps(nation);
-      for (let i = 0; i < steps; i++) {
-        stepArmy(army, this.map);
-        if (this.resolveArmyEncounter(army, nation)) break;
-      }
-
-      army.morale = clamp(army.morale + (army.state === "retreat" ? -3 : 1.5), 10, 100);
-      if (army.state !== "retreat" && !this.isAtWar(nation)) {
-        // 平時は帰還して解散
-        const home = this.getCity(nation.capitalCityId);
-        if (home && Math.round(army.x) === home.x && Math.round(army.y) === home.y) {
-          this.armies = this.armies.filter((a) => a.id !== army.id);
-          nation.armyIds = nation.armyIds.filter((id) => id !== army.id);
-        }
-      }
-    }
-
-    this.resolveSieges();
-    this.checkPeace();
+  private makePerson(nationId: string, culture: Culture, role: "king" | "heir", age: number): Person {
+    const gender = this.rng.bool(0.55) ? "m" : ("f" as const);
+    const p: Person = {
+      id: this.newId("p"),
+      name: this.nameGen.personName(culture, gender),
+      nationId,
+      role,
+      age,
+      gender,
+      bornYear: this.year - age,
+      traits: {
+        wisdom: this.rng.int(15, 95),
+        ambition: this.rng.int(10, 95),
+        charisma: this.rng.int(15, 95)
+      },
+      alive: true
+    };
+    this.people.set(p.id, p);
+    return p;
   }
 
-  private assignArmyTarget(army: Army, nation: Nation) {
-    const enemies = this.enemiesOf(nation);
+  foundNation(
+    x: number,
+    y: number,
+    opts: { pop?: number; radius?: number; silent?: boolean; cultureId?: string; fromCity?: City } = {}
+  ): Nation | null {
+    const spot = this.findLandNear(x, y, 3);
+    if (!spot) return null;
+    const culture = opts.cultureId
+      ? cultureById(opts.cultureId)
+      : this.nameGen.pickCultureFor(this.climateAt(spot.x, spot.y));
+    const { name } = this.nameGen.nationName(culture);
+    const color = NATION_COLORS[this.nations.length % NATION_COLORS.length];
+    const id = this.newId("n");
 
-    if (enemies.length === 0) {
-      const home = this.getCity(nation.capitalCityId);
-      army.state = "march";
-      army.targetNationId = null;
-      army.targetX = home?.x ?? nation.capital.x;
-      army.targetY = home?.y ?? nation.capital.y;
-      return;
-    }
+    const nation: Nation = {
+      id,
+      name,
+      color: color.main,
+      colorDark: color.dark,
+      cultureId: culture.id,
+      dynasty: "",
+      foundedYear: this.year,
+      capitalCityId: null,
+      kingId: null,
+      heirId: null,
+      cityIds: [],
+      armyIds: [],
+      population: 0,
+      treasury: this.rng.int(120, 260),
+      military: 0,
+      tech: 1 + this.rng.range(0, 0.15),
+      stability: this.rng.int(55, 75),
+      warExhaustion: 0,
+      relations: {},
+      territoryCount: 0,
+      alive: true,
+      blessedYears: 0,
+      cursedYears: 0,
+      stats: []
+    };
+    const idx = this.nations.length;
+    this.nations.push(nation);
+    this.nationIdxById.set(id, idx);
 
-    // 士気が折れた軍は撤退
-    if (army.morale < 25) {
-      const home = this.getCity(nation.capitalCityId);
-      army.state = "retreat";
-      army.targetX = home?.x ?? nation.capital.x;
-      army.targetY = home?.y ?? nation.capital.y;
-      return;
-    }
+    const king = this.makePerson(id, culture, "king", this.rng.int(24, 48));
+    king.reignStart = this.year;
+    const heir = this.makePerson(id, culture, "heir", Math.max(4, king.age - this.rng.int(20, 30)));
+    nation.kingId = king.id;
+    nation.heirId = heir.id;
+    nation.dynasty = this.nameGen.dynastyName(culture, king.name);
 
-    let best: { x: number; y: number; nationId: string } | null = null;
-    let bestScore = Infinity;
-
-    for (const enemy of enemies) {
-      for (const city of this.citiesOf(enemy.id)) {
-        const d = Math.hypot(city.x - army.x, city.y - army.y);
-        const score = d - (city.isCapital ? 5 : 0) - (100 - city.fortification) * 0.05;
-        if (score < bestScore) {
-          bestScore = score;
-          best = { x: city.x, y: city.y, nationId: enemy.id };
-        }
+    // 首都
+    if (opts.fromCity) {
+      this.attachCity(opts.fromCity, nation, true);
+    } else {
+      const c = this.createCity(nation, spot.x, spot.y, true, opts.pop ?? 1000);
+      if (!c) {
+        nation.alive = false;
+        return null;
       }
-      // 都市が無ければ最寄りの敵タイル
-      if (!best) {
-        for (const key of enemy.territory) {
-          const [x, y] = key.split(",").map(Number);
-          const d = Math.hypot(x - army.x, y - army.y);
-          if (d < bestScore) {
-            bestScore = d;
-            best = { x, y, nationId: enemy.id };
-          }
-        }
-      }
     }
+    // 初期領土
+    const r = opts.radius ?? 1;
+    this.forEachBrush(spot.x, spot.y, r, (i) => {
+      if (isLand(this.terrain[i]) && this.owner[i] === -1) this.claimTile(nation, i);
+    });
 
-    if (best) {
-      army.targetX = best.x;
-      army.targetY = best.y;
-      army.targetNationId = best.nationId;
-      army.state = "march";
-    }
-  }
-
-  /** 移動先での会戦・占領。戦闘が起きたら true */
-  private resolveArmyEncounter(army: Army, nation: Nation): boolean {
-    const x = Math.round(army.x);
-    const y = Math.round(army.y);
-    const tile = this.map.tiles[y]?.[x];
-    if (!tile) return false;
-
-    // --- 敵軍との会戦 ---
-    const enemyArmy = this.armies.find(
-      (a) =>
-        a.id !== army.id &&
-        a.nationId !== army.nationId &&
-        nation.relations[a.nationId]?.status === "war" &&
-        Math.hypot(a.x - army.x, a.y - army.y) <= 1.2
-    );
-
-    if (enemyArmy) {
-      const enemyNation = this.getNation(enemyArmy.nationId)!;
-      const genA = this.getPerson(army.generalId);
-      const genB = this.getPerson(enemyArmy.generalId);
-      const powerA = battlePower(army, genA?.traits.wisdom ?? 40, tile.terrain, this.rng, false);
-      const powerB = battlePower(enemyArmy, genB?.traits.wisdom ?? 40, tile.terrain, this.rng, true);
-
-      const winner = powerA >= powerB ? army : enemyArmy;
-      const loser = winner === army ? enemyArmy : army;
-      const winnerNation = this.getNation(winner.nationId)!;
-      const loserNation = this.getNation(loser.nationId)!;
-      const ratio = Math.max(powerA, powerB) / Math.max(1, Math.min(powerA, powerB));
-
-      const winnerLoss = Math.round(winner.strength * 0.12);
-      const loserLoss = Math.round(loser.strength * Math.min(0.75, 0.3 + ratio * 0.15));
-      winner.strength = Math.max(0, winner.strength - winnerLoss);
-      loser.strength = Math.max(0, loser.strength - loserLoss);
-      winnerNation.military = Math.max(5, winnerNation.military - winnerLoss);
-      loserNation.military = Math.max(5, loserNation.military - loserLoss);
-      winner.morale = Math.min(100, winner.morale + 8);
-      loser.morale = Math.max(0, loser.morale - 22);
-      loser.state = "retreat";
-      winnerNation.warExhaustion = Math.min(100, winnerNation.warExhaustion + 1.5);
-      loserNation.warExhaustion = Math.min(100, loserNation.warExhaustion + 3);
-
-      const winnerGeneral = this.getPerson(winner.generalId);
-      this.mark(x, y, "field", winner.nationId, loser.nationId);
-      this.ev(
-        "fieldBattle",
-        "war",
-        {
-          nation: winnerNation.name,
-          enemy: loserNation.name,
-          general: winnerGeneral?.name ?? winnerNation.name,
-          place: this.placeName(x, y)
-        },
-        [winnerNation.id, loserNation.id],
-        winnerGeneral ? [winnerGeneral.id] : [],
-        1,
-        { x, y }
+    nation.population = this.sumPopulation(nation);
+    if (!opts.silent) {
+      const title = cultureById(nation.cultureId).kingTitle[king.gender];
+      this.pushEvent(
+        "founding",
+        2,
+        `${nation.name}が建国された。初代${title}は${king.name}。`,
+        [id],
+        spot.x,
+        spot.y
       );
-
-      if (loser.strength <= 5) {
-        this.armies = this.armies.filter((a) => a.id !== loser.id);
-        loserNation.armyIds = loserNation.armyIds.filter((id) => id !== loser.id);
-        this.ev("armyDestroyed", "war", { nation: loserNation.name, army: loser.name, place: this.placeName(x, y) }, [loserNation.id], [], 1, { x, y });
-        if (winnerGeneral) winnerGeneral.achievements.push(`${this.year}年 ${this.placeName(x, y)}の勝利`);
-      }
-      return true;
     }
+    return nation;
+  }
 
-    // --- 敵領タイルの占領 ---
-    if (tile.ownerId && tile.ownerId !== nation.id && nation.relations[tile.ownerId]?.status === "war") {
-      const defender = this.getNation(tile.ownerId)!;
-      if (!tile.cityId) {
-        transferTile(defender, nation, this.map, x, y);
-        if (this.rng.bool(0.12)) {
-          this.ev("tileTaken", "war", { nation: nation.name, enemy: defender.name }, [nation.id, defender.id], [], 0, { x, y });
+  private createCity(nation: Nation, x: number, y: number, capital: boolean, pop: number): City | null {
+    const spot = this.findLandNear(x, y, 2, (i) => this.cityAt[i] === -1);
+    if (!spot) return null;
+    const culture = cultureById(nation.cultureId);
+    const city: City = {
+      id: this.newId("c"),
+      name: this.nameGen.cityName(culture),
+      x: spot.x,
+      y: spot.y,
+      nationId: nation.id,
+      foundedYear: this.year,
+      isCapital: capital,
+      population: pop,
+      prosperity: this.rng.int(30, 50),
+      fortification: capital ? 35 : 15,
+      unrest: 10,
+      plagueTicks: 0,
+      siegeBy: null,
+      siegeProgress: 0
+    };
+    const ci = this.cities.length;
+    this.cities.push(city);
+    this.cityAt[this.idx(spot.x, spot.y)] = ci;
+    nation.cityIds.push(city.id);
+    if (capital) nation.capitalCityId = city.id;
+    this.claimTile(nation, this.idx(spot.x, spot.y));
+    this.markDirty(this.idx(spot.x, spot.y));
+    return city;
+  }
+
+  private attachCity(city: City, nation: Nation, capital: boolean): void {
+    city.nationId = nation.id;
+    city.isCapital = capital;
+    nation.cityIds.push(city.id);
+    if (capital) nation.capitalCityId = city.id;
+    this.claimTile(nation, this.idx(city.x, city.y));
+  }
+
+  findLandNear(
+    x: number,
+    y: number,
+    maxR: number,
+    extra?: (i: number) => boolean
+  ): { x: number; y: number } | null {
+    for (let r = 0; r <= maxR; r++) {
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+          const nx = x + dx;
+          const ny = y + dy;
+          if (!this.inBounds(nx, ny)) continue;
+          const i = this.idx(nx, ny);
+          if (isPassable(this.terrain[i]) && (!extra || extra(i))) return { x: nx, y: ny };
         }
       }
     }
-
-    return false;
+    return null;
   }
 
-  /** 都市の包囲判定 */
-  private resolveSieges() {
-    for (const city of this.cities) {
-      const owner = this.getNation(city.nationId);
-      if (!owner?.alive) continue;
+  // ============================================================
+  // 領土
+  // ============================================================
+  private claimTile(nation: Nation, i: number): void {
+    const prev = this.owner[i];
+    const nIdx = this.nationIdxById.get(nation.id)!;
+    if (prev === nIdx) return;
+    if (prev >= 0) this.nations[prev].territoryCount--;
+    this.owner[i] = nIdx;
+    nation.territoryCount++;
+    this.markDirty(i);
+  }
 
-      const besieger = this.armies.find(
-        (a) =>
-          a.nationId !== city.nationId &&
-          owner.relations[a.nationId]?.status === "war" &&
-          Math.round(a.x) === city.x &&
-          Math.round(a.y) === city.y
-      );
+  private freeTile(i: number): void {
+    const prev = this.owner[i];
+    if (prev >= 0) {
+      this.nations[prev].territoryCount--;
+      this.owner[i] = -1;
+      this.markDirty(i);
+    }
+  }
 
-      if (!besieger) {
-        if (city.siegeBy) {
-          const prev = this.getNation(city.siegeBy);
-          city.siegeBy = null;
-          if (prev) this.ev("siegeBroken", "war", { nation: prev.name, city: city.name }, [prev.id, owner.id], [], 0, { x: city.x, y: city.y });
-        }
-        continue;
-      }
-
-      const attacker = this.getNation(besieger.nationId)!;
-      if (city.siegeBy !== attacker.id) {
-        city.siegeBy = attacker.id;
-        besieger.state = "siege";
-        this.ev("siegeStart", "war", { nation: attacker.name, enemy: owner.name, city: city.name }, [attacker.id, owner.id], [], 1, { x: city.x, y: city.y });
-      }
-
-      // 城壁を削る
-      const general = this.getPerson(besieger.generalId);
-      const siegePower = besieger.strength * (1 + attacker.techLevel * 0.06) * (1 + (general?.traits.wisdom ?? 40) / 250);
-      const defense = city.fortification * 9 + city.population * 0.01 + owner.military * 0.15;
-      city.fortification = Math.max(0, city.fortification - (siegePower / Math.max(1, defense)) * 12);
-      besieger.strength = Math.max(0, Math.round(besieger.strength * 0.97));
-
-      if (city.fortification <= 1 || siegePower > defense * this.rng.range(1.1, 1.8)) {
-        this.captureCity(city, attacker, owner);
+  private forEachBrush(cx: number, cy: number, r: number, cb: (i: number, x: number, y: number) => void): void {
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (dx * dx + dy * dy > r * r + r * 0.5) continue;
+        const x = cx + dx;
+        const y = cy + dy;
+        if (!this.inBounds(x, y)) continue;
+        cb(this.idx(x, y), x, y);
       }
     }
   }
 
-  private captureCity(city: City, attacker: Nation, defender: Nation) {
-    const wasCapital = city.isCapital;
-    transferTile(defender, attacker, this.map, city.x, city.y);
-    city.nationId = attacker.id;
-    city.isCapital = false;
-    city.siegeBy = null;
-    city.prosperity = Math.max(8, city.prosperity * 0.55);
-    city.fortification = Math.max(5, city.fortification * 0.4);
-    city.unrest = Math.min(100, city.unrest + 35);
-    attacker.treasury += Math.round(city.population * 0.03);
-    defender.stability = Math.max(0, defender.stability - (wasCapital ? 18 : 8));
-    defender.legitimacy = Math.max(0, defender.legitimacy - (wasCapital ? 15 : 5));
-
-    // 周囲のタイルも一緒に落ちる
-    for (let dy = -1; dy <= 1; dy++) {
-      for (let dx = -1; dx <= 1; dx++) {
-        const t = this.map.tiles[city.y + dy]?.[city.x + dx];
-        if (t && t.ownerId === defender.id && !t.cityId) {
-          transferTile(defender, attacker, this.map, t.x, t.y);
-        }
-      }
+  private sumPopulation(nation: Nation): number {
+    let p = 0;
+    for (const cid of nation.cityIds) {
+      const c = this.cityById(cid);
+      if (c) p += c.population;
     }
-
-    this.mark(city.x, city.y, "sack", attacker.id, defender.id);
-    this.ev(
-      wasCapital ? "capitalFallen" : "cityCaptured",
-      "war",
-      { nation: attacker.name, enemy: defender.name, city: city.name },
-      [attacker.id, defender.id],
-      [],
-      2,
-      { x: city.x, y: city.y }
-    );
-    if (wasCapital) this.relocateCapital(defender);
+    return Math.round(p);
   }
 
-  /** 厭戦が高まった戦争を終わらせる */
-  private checkPeace() {
-    const seen = new Set<string>();
-    for (const a of this.livingNations()) {
-      for (const [otherId, rel] of Object.entries(a.relations)) {
-        if (rel.status !== "war") continue;
-        const b = this.getNation(otherId);
-        if (!b?.alive) {
-          rel.status = "peace";
+  // ============================================================
+  // 外交
+  // ============================================================
+  relation(a: Nation, b: Nation): Relation {
+    let r = a.relations[b.id];
+    if (!r) {
+      const base = a.cultureId === b.cultureId ? this.rng.int(-5, 25) : this.rng.int(-25, 15);
+      r = { status: "peace", score: base, sinceYear: this.year };
+      a.relations[b.id] = r;
+      b.relations[a.id] = { status: "peace", score: base, sinceYear: this.year };
+    }
+    return r;
+  }
+
+  private setRelation(a: Nation, b: Nation, status: RelationStatus, score?: number, truceUntil?: number): void {
+    const ra = this.relation(a, b);
+    const rb = b.relations[a.id]!;
+    ra.status = rb.status = status;
+    ra.sinceYear = rb.sinceYear = this.year;
+    if (score !== undefined) ra.score = rb.score = score;
+    ra.truceUntil = rb.truceUntil = truceUntil;
+  }
+
+  declareWar(a: Nation, b: Nation, reason: string, depth = 0): void {
+    if (!a.alive || !b.alive || a.id === b.id) return;
+    const r = this.relation(a, b);
+    if (r.status === "war") return;
+    this.setRelation(a, b, "war", -80);
+    this.pushEvent("war", 2, `${a.name}が${b.name}に宣戦布告。${reason}`, [a.id, b.id]);
+    // 同盟国の参戦 (1段のみ・義理堅い同盟だけが動く)
+    if (depth === 0) {
+      for (const ally of this.aliveNations()) {
+        if (ally.id === a.id || ally.id === b.id) continue;
+        if (this.relation(ally, b).status !== "alliance") continue;
+        if (this.relation(ally, a).status === "war") continue;
+        // 疲弊していると参戦を渋る
+        if (ally.warExhaustion > 40 || ally.stability < 40) {
+          this.pushEvent("diplomacy", 0, `${ally.name}は同盟の呼びかけに応じなかった。`, [ally.id, b.id]);
+          this.relation(ally, b).score -= 25;
+          b.relations[ally.id]!.score -= 25;
           continue;
         }
-        const key = a.id < b.id ? `${a.id}|${b.id}` : `${b.id}|${a.id}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-
-        a.warExhaustion = Math.min(100, a.warExhaustion + 0.8);
-        b.warExhaustion = Math.min(100, b.warExhaustion + 0.8);
-
-        const noContact = !areAdjacent(this.adjacency, a.id, b.id) && this.armiesOf(a.id).length + this.armiesOf(b.id).length === 0;
-        const exhausted = Math.max(a.warExhaustion, b.warExhaustion);
-        if (noContact || b.territory.size <= 1 || (exhausted > 45 && this.rng.bool(0.2))) {
-          const winner = powerScore(a) >= powerScore(b) ? a : b;
-          const loser = winner === a ? b : a;
-          const decisive = powerScore(winner) > powerScore(loser) * 2.2 && loser.territory.size <= 8;
-          this.makePeace(winner, loser, decisive);
-        }
+        this.pushEvent("war", 1, `${ally.name}は同盟に従い${b.name}側で参戦した。`, [ally.id]);
+        this.declareWar(ally, a, "同盟の義務", 1);
       }
     }
   }
 
-  private makePeace(a: Nation, b: Nation, vassalize: boolean) {
-    const relA = relationOf(a, b.id);
-    const relB = relationOf(b, a.id);
-    relA.score = -25;
-    relB.score = -25;
-    relA.since = this.year;
-    relB.since = this.year;
+  makePeace(a: Nation, b: Nation, note = ""): void {
+    const r = this.relation(a, b);
+    if (r.status !== "war") return;
+    this.setRelation(a, b, "truce", -15, this.year + 8);
     a.warExhaustion = Math.max(0, a.warExhaustion - 25);
     b.warExhaustion = Math.max(0, b.warExhaustion - 25);
-
-    for (const city of this.cities) city.siegeBy = null;
-
-    if (vassalize && !b.overlordId && b.id !== a.overlordId) {
-      b.overlordId = a.id;
-      relA.status = "vassal";
-      relB.status = "vassal";
-      this.ev("vassalized", "diplomacy", { nation: a.name, enemy: b.name }, [a.id, b.id], [], 2);
-    } else {
-      relA.status = "truce";
-      relB.status = "truce";
-      relA.truceUntil = this.year + this.rng.int(8, 20);
-      relB.truceUntil = relA.truceUntil;
-      this.ev("warDefeatPeace", "diplomacy", { nation: a.name, enemy: b.name }, [a.id, b.id], [], 1);
-    }
-  }
-
-  private placeName(x: number, y: number): string {
-    let nearest: City | null = null;
-    let best = Infinity;
-    for (const c of this.cities) {
-      const d = Math.hypot(c.x - x, c.y - y);
-      if (d < best) {
-        best = d;
-        nearest = c;
-      }
-    }
-    if (nearest && best < 6) return `${nearest.name}近郊`;
-    const tile = this.map.tiles[y]?.[x];
-    return tile ? `${tile.terrain === "mountain" ? "山間" : tile.terrain === "forest" ? "森" : "平原"}の地` : "辺境";
-  }
-
-  // ---------------- 都市 ----------------
-  private syncCities() {
-    for (const nation of this.nations) nation.cityIds = [];
-    for (const city of this.cities) {
-      const owner = this.map.tiles[city.y]?.[city.x]?.ownerId ?? null;
-      if (owner && owner !== city.nationId) {
-        city.nationId = owner;
-        city.isCapital = false;
-        city.prosperity = Math.max(8, city.prosperity * 0.75);
-      }
-      const nation = this.getNation(city.nationId);
-      if (nation?.alive) nation.cityIds.push(city.id);
-    }
-    for (const nation of this.livingNations()) {
-      const capital = this.getCity(nation.capitalCityId);
-      if (!capital || capital.nationId !== nation.id) this.relocateCapital(nation);
-    }
-  }
-
-  private relocateCapital(nation: Nation) {
-    const own = this.citiesOf(nation.id);
-    if (own.length > 0) {
-      const next = own.reduce((best, c) => (c.prosperity > best.prosperity ? c : best), own[0]);
-      next.isCapital = true;
-      nation.capitalCityId = next.id;
-      nation.capital = { x: next.x, y: next.y };
-    } else {
-      const first = Array.from(nation.territory)[0];
-      if (first) {
-        const [x, y] = first.split(",").map(Number);
-        nation.capital = { x, y };
-        nation.capitalCityId = null;
-      }
-    }
-  }
-
-  private simulateCities() {
-    for (const nation of this.livingNations()) {
-      updateCities(nation, this.cities, this.rng);
-
-      const quota = (nation.cityIds.length + 1) * 9;
-      if (nation.territory.size >= quota && nation.treasury > 260 && this.rng.bool(0.16)) {
-        const site = findCitySite(nation, this.map, this.cities);
-        if (site) {
-          const city = createCity(nation, site.x, site.y, this.names, this.rng, this.year);
-          this.addCity(city);
-          attachCity(nation, city, this.map);
-          nation.treasury -= 180;
-          this.ev("cityFounded", "city", { nation: nation.name, city: city.name }, [nation.id], [], 1, { x: city.x, y: city.y });
-        }
-      }
-
-      for (const city of this.citiesOf(nation.id)) {
-        if (city.prosperity > 85 && this.rng.bool(0.01)) {
-          this.ev("cityBoom", "city", { nation: nation.name, city: city.name }, [nation.id], [], 1, { x: city.x, y: city.y });
-        }
-      }
-    }
-  }
-
-  // ---------------- 継承 ----------------
-  private simulateSuccession() {
-    for (const person of this.people) if (person.alive) person.age += 1;
-
-    for (const nation of this.livingNations()) {
-      const king = this.kingOf(nation.id);
-      if (!king) {
-        this.enthroneNewRuler(nation, null);
-        continue;
-      }
-
-      const heirs = this.people.filter((p) => p.alive && p.nationId === nation.id && p.role === "heir");
-      if (king.age >= 20 && king.age <= 58 && heirs.length < 3 && this.rng.bool(0.13)) {
-        const heir = createHeir(nation, king, this.names, this.rng, this.year);
-        this.addPerson(heir);
-        this.ev("heirBorn", "succession", { nation: nation.name, king: king.name, heir: heir.name }, [nation.id], [king.id, heir.id]);
-      }
-
-      let deathChance = king.age > 58 ? 0.04 + (king.age - 58) * 0.012 : 0.006;
-      if (king.traits.cruelty > 75 && nation.stability < 40) deathChance += 0.03;
-      if (this.rng.bool(deathChance)) {
-        king.alive = false;
-        king.diedYear = this.year;
-        this.enthroneNewRuler(nation, king);
-      }
-    }
-
-    for (const person of this.people) {
-      if (!person.alive || person.role === "king") continue;
-      const limit = person.role === "heir" ? 0.01 : 0.03;
-      if (person.age > 62 && this.rng.bool(limit + (person.age - 62) * 0.01)) {
-        person.alive = false;
-        person.diedYear = this.year;
-        const nation = this.getNation(person.nationId);
-        if (nation?.alive && person.role !== "heir") {
-          this.addPerson(createPerson(nation, person.role as PersonRole, this.names, this.rng, this.year));
-        }
-      }
-    }
-
-    // 空いた役職の補充
-    for (const nation of this.livingNations()) {
-      for (const role of COURT_ROLES) {
-        const exists = this.people.some((p) => p.alive && p.nationId === nation.id && p.role === role);
-        if (!exists && this.rng.bool(0.35)) {
-          this.addPerson(createPerson(nation, role, this.names, this.rng, this.year));
-        }
-      }
-    }
-  }
-
-  private enthroneNewRuler(nation: Nation, oldKing: Person | null) {
-    const heirs = this.people
-      .filter((p) => p.alive && p.nationId === nation.id && p.role === "heir")
-      .sort((a, b) => b.age - a.age);
-
-    if (heirs.length > 0) {
-      const heir = heirs[0];
-      heir.role = "king";
-      heir.reignStart = this.year;
-      nation.kingId = heir.id;
-      nation.dynasty = heir.dynasty || nation.dynasty;
-
-      if (heir.age < 16) {
-        nation.stability = Math.max(0, nation.stability - 8);
-        nation.legitimacy = Math.max(0, nation.legitimacy - 10);
-        this.ev("regency", "succession", { nation: nation.name, newKing: heir.name }, [nation.id], [heir.id], 1);
-      } else {
-        this.ev("succession", "succession", { nation: nation.name, oldKing: oldKing?.name ?? "先王", newKing: heir.name, dynasty: nation.dynasty }, [nation.id], oldKing ? [oldKing.id, heir.id] : [heir.id], 1);
-      }
-      return;
-    }
-
-    const newDynasty = this.names.dynastyName(nation.cultureId);
-    nation.dynasty = newDynasty;
-    nation.stability = Math.max(0, nation.stability - 22);
-    nation.legitimacy = Math.max(0, nation.legitimacy - 30);
-    const usurper = createPerson(nation, "king", this.names, this.rng, this.year, { age: this.rng.int(26, 48), dynasty: newDynasty });
-    usurper.reignStart = this.year;
-    this.addPerson(usurper);
-    nation.kingId = usurper.id;
-    this.ev("successionCrisis", "succession", { nation: nation.name, oldKing: oldKing?.name ?? "先王", newKing: usurper.name, dynasty: newDynasty }, [nation.id], oldKing ? [oldKing.id, usurper.id] : [usurper.id], 2);
-  }
-
-  // ==========================================================
-  // 諜報・謀反・亡命
-  // ==========================================================
-  private simulateIntrigue() {
-    for (const nation of this.livingNations()) {
-      const spy = bestOfRole(this.peopleOf(nation.id), nation.id, "spy", "wisdom");
-      if (spy && this.rng.bool(0.1 + spy.traits.wisdom / 900)) this.runSpyOperation(nation, spy);
-
-      // 将軍の謀反
-      const general = bestOfRole(this.peopleOf(nation.id), nation.id, "general", "ambition");
+    this.pushEvent("diplomacy", 1, `${a.name}と${b.name}が休戦した。${note}`, [a.id, b.id]);
+    // 進軍中の軍を帰還させる
+    for (const army of this.armies.values()) {
       if (
-        general &&
-        general.traits.ambition > 72 &&
-        general.loyalty < 35 &&
-        nation.stability < 42 &&
-        this.rng.bool(0.05)
+        (army.nationId === a.id || army.nationId === b.id) &&
+        army.targetCityId &&
+        this.cityById(army.targetCityId) &&
+        (this.cityById(army.targetCityId)!.nationId === a.id || this.cityById(army.targetCityId)!.nationId === b.id)
       ) {
-        const dynasty = this.names.dynastyName(nation.cultureId);
-        const oldKing = this.kingOf(nation.id);
-        if (oldKing) {
-          oldKing.alive = false;
-          oldKing.diedYear = this.year;
+        this.sendArmyHome(army);
+      }
+    }
+  }
+
+  makeAlliance(a: Nation, b: Nation): void {
+    this.setRelation(a, b, "alliance", Math.max(this.relation(a, b).score, 70));
+    this.pushEvent("diplomacy", 2, `${a.name}と${b.name}が同盟を結んだ。`, [a.id, b.id]);
+  }
+
+  private atWarWith(n: Nation): Nation[] {
+    return this.aliveNations().filter((o) => o.id !== n.id && this.relation(n, o).status === "war");
+  }
+
+  // ============================================================
+  // メインループ: 1ヶ月進める
+  // ============================================================
+  step(): void {
+    this.tick++;
+    // 補間用に前位置を記録
+    for (const a of this.armies.values()) {
+      a.px = a.x;
+      a.py = a.y;
+    }
+    for (const u of this.units) {
+      u.px = u.x;
+      u.py = u.y;
+    }
+    for (const t of this.tornadoes) {
+      t.px = t.x;
+      t.py = t.y;
+    }
+
+    this.updateEnvironment();
+    this.rebuildBorders();
+    this.updateNationsMonthly();
+    this.updateWarFronts();
+    this.updateArmies();
+    if (this.month === 0) this.updateYearly();
+    this.updateUnits();
+    this.updateTornadoes();
+
+    // fx寿命
+    for (const f of this.fx) f.age++;
+    this.fx = this.fx.filter((f) => f.age <= f.life);
+    if (this.fx.length > 300) this.fx.splice(0, this.fx.length - 300);
+  }
+
+  // ---- 環境 (火事・疫病・再生) ------------------------------
+  private updateEnvironment(): void {
+    // 火の延焼と鎮火
+    if (this.burningTiles.size > 0) {
+      const toIgnite: number[] = [];
+      for (const i of this.burningTiles) {
+        this.burn[i]--;
+        const x = i % this.width;
+        const y = Math.floor(i / this.width);
+        const cIdx = this.cityAt[i];
+        if (cIdx >= 0) {
+          const c = this.cities[cIdx];
+          c.population = Math.max(0, Math.floor(c.population * 0.94));
+          c.prosperity = Math.max(0, c.prosperity - 2);
         }
-        general.role = "king";
-        general.dynasty = dynasty;
-        general.reignStart = this.year;
-        nation.kingId = general.id;
-        nation.dynasty = dynasty;
-        nation.stability = Math.max(0, nation.stability - 18);
-        nation.legitimacy = Math.max(0, nation.legitimacy - 35);
-        this.ev("coup", "intrigue", { nation: nation.name, general: general.name, dynasty }, [nation.id], [general.id], 2);
-        continue;
-      }
-
-      // 忠誠が低い人物の亡命
-      for (const person of this.peopleOf(nation.id)) {
-        if (person.role === "king" || person.role === "heir") continue;
-        person.loyalty = clamp(person.loyalty + (nation.stability - 50) / 40 + this.rng.range(-1.5, 1.5), 0, 100);
-        if (person.loyalty > 18 || !this.rng.bool(0.06)) continue;
-
-        const dest = this.livingNations().filter((n) => n.id !== nation.id && n.relations[nation.id]?.status !== "war");
-        if (dest.length === 0) continue;
-        const target = this.rng.pick(dest);
-        person.nationId = target.id;
-        person.loyalty = 55;
-        this.ev("defect", "intrigue", { nation: nation.name, enemy: target.name, person: person.name }, [nation.id, target.id], [person.id], 1);
-      }
-    }
-  }
-
-  private runSpyOperation(nation: Nation, spy: Person) {
-    const rivals = this.livingNations()
-      .filter((n) => n.id !== nation.id && (nation.relations[n.id]?.score ?? 0) < 20)
-      .sort((a, b) => (nation.relations[a.id]?.score ?? 0) - (nation.relations[b.id]?.score ?? 0));
-    if (rivals.length === 0) return;
-    const target = rivals[0];
-
-    // 露見判定
-    const targetSpy = bestOfRole(this.peopleOf(target.id), target.id, "spy", "wisdom");
-    const caught = this.rng.bool(0.18 + ((targetSpy?.traits.wisdom ?? 20) - spy.traits.wisdom) / 400);
-    if (caught) {
-      const rel = relationOf(nation, target.id);
-      const relB = relationOf(target, nation.id);
-      rel.score = clamp(rel.score - 25, -100, 100);
-      relB.score = rel.score;
-      spy.alive = false;
-      spy.diedYear = this.year;
-      this.ev("spyCaught", "intrigue", { nation: nation.name, enemy: target.name, spy: spy.name }, [nation.id, target.id], [spy.id], 1);
-      return;
-    }
-
-    const roll = this.rng.next();
-    if (roll < 0.3) {
-      const loot = Math.round(target.treasury * 0.15);
-      target.treasury = Math.max(0, target.treasury - loot);
-      this.ev("spySabotage", "intrigue", { nation: nation.name, enemy: target.name, spy: spy.name }, [nation.id, target.id], [spy.id], 1);
-    } else if (roll < 0.55 && target.techLevel > nation.techLevel) {
-      nation.techLevel += 1;
-      this.ev("spyStealTech", "intrigue", { nation: nation.name, enemy: target.name, spy: spy.name }, [nation.id, target.id], [spy.id], 1);
-    } else if (roll < 0.9) {
-      const cities = this.citiesOf(target.id);
-      if (cities.length === 0) return;
-      const city = this.rng.pick(cities);
-      city.unrest = Math.min(100, city.unrest + 28);
-      target.stability = Math.max(0, target.stability - 5);
-      this.ev("spyIncite", "intrigue", { nation: nation.name, enemy: target.name, city: city.name }, [nation.id, target.id], [spy.id], 1, { x: city.x, y: city.y });
-    } else {
-      const victim = this.kingOf(target.id);
-      if (!victim || !this.rng.bool(0.4)) return;
-      victim.alive = false;
-      victim.diedYear = this.year;
-      target.stability = Math.max(0, target.stability - 12);
-      const rel = relationOf(target, nation.id);
-      rel.score = clamp(rel.score - 40, -100, 100);
-      this.ev("spyAssassinate", "intrigue", { nation: nation.name, enemy: target.name, victim: victim.name }, [nation.id, target.id], [spy.id, victim.id], 2);
-      this.enthroneNewRuler(target, victim);
-    }
-  }
-
-  // ---------------- 自然 ----------------
-  private simulateNature() {
-    for (const nation of this.livingNations()) {
-      const roll = this.rng.next();
-      const hygiene = 1 - nation.techLevel * 0.05;
-      if (roll < 0.028 * hygiene) {
-        nation.population = Math.round(nation.population * 0.86);
-        for (const c of this.citiesOf(nation.id)) c.prosperity = Math.max(5, c.prosperity - 6);
-        this.ev("plague", "nature", { nation: nation.name }, [nation.id], [], 1);
-      } else if (roll < 0.05) {
-        nation.population = Math.round(nation.population * 0.93);
-        nation.stability = Math.max(0, nation.stability - 7);
-        this.ev("famine", "nature", { nation: nation.name }, [nation.id], [], 1);
-      } else if (roll < 0.1) {
-        nation.treasury += Math.round(nation.population * 0.008);
-        nation.stability = Math.min(100, nation.stability + 2);
-        this.ev("goodHarvest", "nature", { nation: nation.name }, [nation.id]);
-      }
-    }
-  }
-
-  // ---------------- 技術 ----------------
-  private simulateTech() {
-    for (const nation of this.livingNations()) {
-      if (nation.techLevel >= 12) continue;
-      const scholar = bestOfRole(this.peopleOf(nation.id), nation.id, "scholar", "wisdom");
-      const chance =
-        (0.03 + (scholar?.traits.wisdom ?? 40) / 2000 + nation.cityIds.length * 0.004 + nation.stability / 4000) /
-        (1 + nation.techLevel * 0.55);
-      if (this.rng.bool(chance)) {
-        nation.techLevel += 1;
-        this.ev("techBreakthrough", "discovery", { nation: nation.name, scholar: scholar?.name ?? nation.name, tech: nation.techLevel }, [nation.id], scholar ? [scholar.id] : [], 1);
-      }
-    }
-  }
-
-  // ---------------- 内乱・分裂 ----------------
-  private simulateUnrest() {
-    for (const nation of this.livingNations()) {
-      if (nation.overlordId) {
-        const overlord = this.getNation(nation.overlordId);
-        if (!overlord?.alive) {
-          nation.overlordId = null;
+        if (this.burn[i] <= 0) {
+          this.burningTiles.delete(i);
+          if (FLAMMABLE.has(this.terrain[i])) {
+            this.terrain[i] = T.burnt;
+            this.fertility[i] = 0.2;
+          }
+          this.markDirty(i);
         } else {
-          if ((nation.military > overlord.military * 0.7 || overlord.stability < 35) && this.rng.bool(0.07)) {
-            nation.overlordId = null;
-            const relA = relationOf(nation, overlord.id);
-            const relB = relationOf(overlord, nation.id);
-            relA.status = "war";
-            relB.status = "war";
-            relA.score = -70;
-            relB.score = -70;
-            this.ev("vassalFreed", "diplomacy", { nation: nation.name, enemy: overlord.name }, [nation.id, overlord.id], [], 2);
-          } else if (powerScore(overlord) > powerScore(nation) * 3 && this.rng.bool(0.035)) {
-            this.annexNation(nation, overlord);
-            continue;
+          for (const [dx, dy] of DIRS4) {
+            const nx = x + dx;
+            const ny = y + dy;
+            if (!this.inBounds(nx, ny)) continue;
+            const j = this.idx(nx, ny);
+            if (this.burn[j] === 0 && FLAMMABLE.has(this.terrain[j]) && this.terrain[j] !== T.plains && this.rng.bool(0.32)) {
+              toIgnite.push(j);
+            }
+          }
+        }
+      }
+      for (const j of toIgnite) this.igniteTile(j, this.rng.int(2, 4));
+    }
+
+    // 焦土・溶岩の回復 (毎月ランダムサンプリング)
+    const samples = 240;
+    const size = this.width * this.height;
+    for (let s = 0; s < samples; s++) {
+      const i = this.rng.int(0, size - 1);
+      const t = this.terrain[i];
+      if (t === T.burnt && this.rng.bool(0.12)) {
+        this.terrain[i] = this.moisture[i] > 0.55 ? T.forest : T.plains;
+        this.fertility[i] = Math.min(1, this.fertility[i] + 0.3);
+        this.markDirty(i);
+      } else if (t === T.lava && this.rng.bool(0.18)) {
+        this.terrain[i] = T.mountain;
+        this.markDirty(i);
+      }
+    }
+
+    // 疫病
+    for (const c of this.cities) {
+      if (c.plagueTicks > 0) {
+        c.plagueTicks--;
+        c.population = Math.max(0, Math.floor(c.population * 0.972));
+        c.prosperity = Math.max(0, c.prosperity - 1);
+        c.unrest = Math.min(100, c.unrest + 1);
+        if (c.plagueTicks === 0) {
+          this.pushEvent("disaster", 0, `${c.name}の疫病が終息した。`, [c.nationId], c.x, c.y);
+        } else if (this.rng.bool(0.05)) {
+          // 近隣都市へ伝播
+          let nearest: City | null = null;
+          let best = 13;
+          for (const o of this.cities) {
+            if (o === c || o.plagueTicks > 0 || o.population < 100) continue;
+            const d = Math.hypot(o.x - c.x, o.y - c.y);
+            if (d < best) {
+              best = d;
+              nearest = o;
+            }
+          }
+          if (nearest) {
+            nearest.plagueTicks = this.rng.int(14, 22);
+            this.pushEvent("disaster", 1, `疫病が${nearest.name}に飛び火した。`, [nearest.nationId], nearest.x, nearest.y);
+          }
+        }
+      }
+    }
+  }
+
+  igniteTile(i: number, months: number): void {
+    if (isWater(this.terrain[i]) || this.terrain[i] === T.lava) return;
+    if (!FLAMMABLE.has(this.terrain[i]) && this.cityAt[i] === -1) return;
+    this.burn[i] = Math.max(this.burn[i], months);
+    this.burningTiles.add(i);
+  }
+
+  // ---- 国境タイルの再計算 (月1回、全走査1パス) ---------------
+  private rebuildBorders(): void {
+    this.borders.clear();
+    this.contacts.clear();
+    const w = this.width;
+    const h = this.height;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        const o = this.owner[i];
+        if (o < 0 || !this.nations[o].alive) continue;
+        let isBorder = false;
+        for (const [dx, dy] of DIRS4) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const j = ny * w + nx;
+          const oj = this.owner[j];
+          if (oj === -1 && isLand(this.terrain[j])) {
+            isBorder = true;
+          } else if (oj >= 0 && oj !== o && isLand(this.terrain[j])) {
+            // 他国と接するタイル (前線候補)
+            let list = this.contacts.get(o);
+            if (!list) this.contacts.set(o, (list = []));
+            list.push({ i: j, enemy: oj });
+          }
+        }
+        if (isBorder) {
+          let arr = this.borders.get(o);
+          if (!arr) this.borders.set(o, (arr = []));
+          arr.push(i);
+        }
+      }
+    }
+  }
+
+  /**
+   * 戦争中の国境侵食。
+   * 都市を落とさなくても、優勢な側が敵領を少しずつ削り取っていく。
+   */
+  private updateWarFronts(): void {
+    for (const [nIdx, list] of this.contacts) {
+      const n = this.nations[nIdx];
+      if (!n.alive || list.length === 0) continue;
+      const power = (x: Nation) =>
+        x.military * 0.5 +
+        x.armyIds.reduce((s, id) => s + (this.armies.get(id)?.strength ?? 0), 0) +
+        x.population * 0.02 * x.tech;
+      const myPower = power(n);
+      const tries = Math.min(10, 2 + Math.floor(list.length / 24));
+      for (let k = 0; k < tries; k++) {
+        const pick = list[this.rng.int(0, list.length - 1)];
+        const enemy = this.nations[pick.enemy];
+        if (!enemy || !enemy.alive) continue;
+        if (this.relation(n, enemy).status !== "war") continue;
+        if (this.cityAt[pick.i] !== -1) continue; // 都市は包囲でしか取れない
+        const ratio = myPower / (myPower + power(enemy) + 1);
+        if (this.rng.bool(Math.max(0, (ratio - 0.5) * 0.5))) {
+          this.claimTile(n, pick.i);
+        }
+      }
+    }
+  }
+
+  // ---- 毎月の国家処理 (領土拡張・都市成長) -------------------
+  private updateNationsMonthly(): void {
+    for (let nIdx = 0; nIdx < this.nations.length; nIdx++) {
+      const n = this.nations[nIdx];
+      if (!n.alive) continue;
+
+      // 領土拡張 (WorldBox風のにじみ拡大)
+      const border = this.borders.get(nIdx);
+      if (border && border.length > 0) {
+        const attempts = Math.min(16, 2 + n.cityIds.length * 2);
+        for (let a = 0; a < attempts; a++) {
+          const i = border[this.rng.int(0, border.length - 1)];
+          const x = i % this.width;
+          const y = Math.floor(i / this.width);
+          const [dx, dy] = DIRS4[this.rng.int(0, 3)];
+          const nx = x + dx;
+          const ny = y + dy;
+          if (!this.inBounds(nx, ny)) continue;
+          const j = this.idx(nx, ny);
+          if (this.owner[j] !== -1 || !isLand(this.terrain[j])) continue;
+          const t = this.terrain[j];
+          if ((t === T.mountain || t === T.lava) && !this.rng.bool(0.08)) continue;
+          let p = 0.2 + this.fertility[j] * 0.45 + (n.stability - 50) / 350;
+          if (n.blessedYears > 0) p += 0.2;
+          if (n.cursedYears > 0) p -= 0.2;
+          if (this.rng.bool(Math.max(0.02, Math.min(0.9, p)))) {
+            this.claimTile(n, j);
           }
         }
       }
 
-      // 都市の反乱。多くは鎮圧されるが、条件が揃うと独立国が生まれる
-      for (const city of this.citiesOf(nation.id)) {
-        if (city.unrest < 80) continue;
-        const canBreakAway =
-          this.canSpawnNation() &&
-          nation.stability < 45 &&
-          nation.territory.size >= 8 &&
-          this.citiesOf(nation.id).length >= 2 &&
-          this.rng.bool(0.18);
-        if (canBreakAway) {
-          this.cityRevolt(nation, city);
-        } else if (this.rng.bool(0.4)) {
-          city.unrest = Math.max(0, city.unrest - 35);
-          nation.stability = Math.max(0, nation.stability - 3);
-          nation.population = Math.round(nation.population * 0.99);
-          this.ev("rebellion", "war", { nation: nation.name }, [nation.id], [], 1, { x: city.x, y: city.y });
-        }
-        break;
+      // 都市の成長 (毎月)
+      for (const cid of n.cityIds) {
+        const c = this.cityById(cid);
+        if (!c) continue;
+        if (c.siegeBy || c.plagueTicks > 0) continue;
+        const fert = this.fertility[this.idx(c.x, c.y)];
+        const cap = 2600 + c.prosperity * 190 + (c.isCapital ? 4200 : 0);
+        const g = 0.004 * (0.5 + fert) * (0.6 + c.prosperity / 120) * (1 - c.unrest / 220);
+        c.population = Math.min(cap, Math.floor(c.population * (1 + g)) + 1);
       }
+      n.population = this.sumPopulation(n);
+    }
+  }
 
-      if (nation.stability >= 26) continue;
+  // ============================================================
+  // 軍団
+  // ============================================================
+  private createArmy(n: Nation, x: number, y: number, strength: number): Army {
+    const army: Army = {
+      id: this.newId("a"),
+      nationId: n.id,
+      name: this.nameGen.armyName(cultureById(n.cultureId), n.armyIds.length + 1),
+      x,
+      y,
+      px: x,
+      py: y,
+      tx: x,
+      ty: y,
+      strength: Math.round(strength),
+      morale: 80,
+      state: "guard",
+      targetCityId: null,
+      atSea: false,
+      seaMonths: 0
+    };
+    this.armies.set(army.id, army);
+    n.armyIds.push(army.id);
+    return army;
+  }
 
-      if (nation.stability < 15 && nation.territory.size >= 10 && this.canSpawnNation(nation.territory.size > 50) && this.rng.bool(0.12)) {
-        this.secede(nation);
+  private disbandArmy(army: Army, returnManpower = true): void {
+    const n = this.nationById(army.nationId);
+    if (n) {
+      n.armyIds = n.armyIds.filter((id) => id !== army.id);
+      if (returnManpower) n.military += army.strength * 0.4;
+    }
+    // 包囲を解除
+    if (army.targetCityId) {
+      const c = this.cityById(army.targetCityId);
+      if (c && c.siegeBy === army.nationId) {
+        c.siegeBy = null;
+        c.siegeProgress = 0;
+      }
+    }
+    this.armies.delete(army.id);
+  }
+
+  private sendArmyHome(army: Army): void {
+    const n = this.nationById(army.nationId);
+    const cap = n ? this.cityById(n.capitalCityId) : null;
+    if (army.targetCityId) {
+      const c = this.cityById(army.targetCityId);
+      if (c && c.siegeBy === army.nationId) {
+        c.siegeBy = null;
+        c.siegeProgress = 0;
+      }
+    }
+    army.targetCityId = null;
+    if (cap) {
+      army.state = "return";
+      army.tx = cap.x;
+      army.ty = cap.y;
+    } else {
+      this.disbandArmy(army);
+    }
+  }
+
+  private armyPickTarget(army: Army): void {
+    const n = this.nationById(army.nationId);
+    if (!n) return;
+    const enemies = this.atWarWith(n);
+    let best: City | null = null;
+    let bestD = Infinity;
+    for (const e of enemies) {
+      for (const cid of e.cityIds) {
+        const c = this.cityById(cid);
+        if (!c) continue;
+        const d = Math.hypot(c.x - army.x, c.y - army.y);
+        if (d < bestD) {
+          bestD = d;
+          best = c;
+        }
+      }
+    }
+    if (best) {
+      army.state = "march";
+      army.targetCityId = best.id;
+      army.tx = best.x;
+      army.ty = best.y;
+    } else {
+      this.sendArmyHome(army);
+    }
+  }
+
+  private updateArmies(): void {
+    const list = [...this.armies.values()];
+
+    // --- 会戦判定 (敵対する軍が接近したら) ---
+    const fought = new Set<string>();
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        const a = list[i];
+        const b = list[j];
+        if (!this.armies.has(a.id) || !this.armies.has(b.id)) continue;
+        if (a.nationId === b.nationId) continue;
+        const na = this.nationById(a.nationId);
+        const nb = this.nationById(b.nationId);
+        if (!na || !nb) continue;
+        if (this.relation(na, nb).status !== "war") continue;
+        if (Math.hypot(a.x - b.x, a.y - b.y) > 1.7) continue;
+        const key = a.id + b.id;
+        if (fought.has(key)) continue;
+        fought.add(key);
+        this.resolveBattle(a, b, na, nb);
+      }
+    }
+
+    // --- 移動と包囲 ---
+    for (const army of list) {
+      if (!this.armies.has(army.id)) continue;
+      const n = this.nationById(army.nationId);
+      if (!n || !n.alive) {
+        this.disbandArmy(army, false);
         continue;
       }
 
-      if (this.rng.bool(0.12)) {
-        nation.stability = Math.min(100, nation.stability + 14);
-        nation.military = Math.round(nation.military * 0.85);
-        nation.population = Math.round(nation.population * 0.98);
-        this.ev("rebellion", "war", { nation: nation.name }, [nation.id], [], 1);
+      // 目標都市の状態確認
+      if (army.targetCityId) {
+        const c = this.cityById(army.targetCityId);
+        const tn = c ? this.nationById(c.nationId) : null;
+        if (!c || !tn || this.relation(n, tn).status !== "war") {
+          this.armyPickTarget(army);
+        }
+      } else if (army.state === "guard" && this.atWarWith(n).length > 0) {
+        this.armyPickTarget(army);
+      }
+
+      const dist = Math.hypot(army.tx - army.x, army.ty - army.y);
+      if (dist > 0.7) {
+        this.moveArmy(army);
+      } else if (army.state === "march" && army.targetCityId) {
+        // 包囲開始
+        const c = this.cityById(army.targetCityId)!;
+        army.state = "siege";
+        if (!c.siegeBy) {
+          c.siegeBy = army.nationId;
+          c.siegeProgress = 0;
+          this.pushEvent("war", 1, `${n.name}軍が${c.name}を包囲した。`, [n.id, c.nationId], c.x, c.y);
+        }
+      } else if (army.state === "return") {
+        army.state = "guard";
+      }
+
+      // 包囲の進行
+      if (army.state === "siege" && army.targetCityId) {
+        const c = this.cityById(army.targetCityId)!;
+        if (c.siegeBy === army.nationId) {
+          c.siegeProgress += Math.max(2, 9 + army.strength / 80 - c.fortification / 7);
+          c.population = Math.max(50, Math.floor(c.population * 0.985));
+          c.fortification = Math.max(0, c.fortification - 1);
+          if (c.siegeProgress >= 100) {
+            this.captureCity(c, n, army);
+          }
+        }
+      }
+
+      // 士気の自然回復
+      if (army.state !== "siege") army.morale = Math.min(100, army.morale + 2);
+    }
+  }
+
+  private moveArmy(army: Army): void {
+    const speed = army.atSea ? 0.5 : 0.9;
+    const dx = army.tx - army.x;
+    const dy = army.ty - army.y;
+    const d = Math.hypot(dx, dy) || 1;
+    let nx = army.x + (dx / d) * speed;
+    let ny = army.y + (dy / d) * speed;
+    const txi = Math.round(nx);
+    const tyi = Math.round(ny);
+    if (this.inBounds(txi, tyi)) {
+      const t = this.terrain[this.idx(txi, tyi)];
+      if (t === T.mountain || t === T.lava) {
+        // 山は迂回を試みる
+        const ang = Math.atan2(dy, dx) + (this.rng.bool() ? 0.9 : -0.9);
+        nx = army.x + Math.cos(ang) * speed;
+        ny = army.y + Math.sin(ang) * speed;
       }
     }
-  }
-
-  /** 都市が反旗を翻して独立国になる */
-  private cityRevolt(parent: Nation, city: City) {
-    const rebel = this.spawnBreakawayNation(parent, { x: city.x, y: city.y }, 0.2);
-    if (!rebel) return;
-    city.unrest = 20;
-    this.ev("cityRevolt", "intrigue", { nation: parent.name, city: city.name, rebel: rebel.name }, [parent.id, rebel.id], [], 2, { x: city.x, y: city.y });
-  }
-
-  private secede(parent: Nation) {
-    const region = carveRegion(parent, this.map, 0.35);
-    if (region.length < 2) return;
-    const rebel = this.spawnBreakawayNation(parent, region[0], 0.35, region);
-    if (!rebel) return;
-    parent.stability = Math.min(100, parent.stability + 12);
-    this.ev("secession", "war", { nation: parent.name, rebel: rebel.name }, [parent.id, rebel.id], [], 2, { x: rebel.capital.x, y: rebel.capital.y });
-  }
-
-  /** 親国から領域を切り出して独立国を作る共通処理 */
-  private spawnBreakawayNation(
-    parent: Nation,
-    seed: { x: number; y: number },
-    share: number,
-    presetRegion?: { x: number; y: number }[]
-  ): Nation | null {
-    const region = presetRegion ?? this.regionAround(parent, seed, Math.max(3, Math.floor(parent.territory.size * share)));
-    if (region.length < 2) return null;
-
-    const id = nextId("nation");
-    const cultureId = parent.cultureId;
-    const rebel = createNation(
-      id,
-      this.names.nationName(cultureId),
-      cultureId,
-      this.names.dynastyName(cultureId),
-      pickColor(this.nations.map((n) => n.color), this.rng),
-      { x: seed.x, y: seed.y },
-      this.year,
-      this.rng
-    );
-    rebel.techLevel = parent.techLevel;
-    rebel.population = Math.round(parent.population * share);
-    rebel.stability = 55;
-    rebel.legitimacy = 45;
-    parent.population = Math.max(500, Math.round(parent.population * (1 - share)));
-
-    for (const t of region) {
-      if (this.map.tiles[t.y]?.[t.x]?.ownerId !== parent.id) continue;
-      transferTile(parent, rebel, this.map, t.x, t.y);
-    }
-    if (rebel.territory.size < 2) return null;
-
-    this.addNation(rebel);
-    this.addPeople(spawnCourt(rebel, this.names, this.rng, this.year));
-
-    // 領域内の都市を接収
-    for (const city of this.cities) {
-      if (this.map.tiles[city.y]?.[city.x]?.ownerId === rebel.id) city.nationId = rebel.id;
-    }
-    if (this.citiesOf(rebel.id).length === 0) {
-      const city = createCity(rebel, seed.x, seed.y, this.names, this.rng, this.year, true);
-      this.addCity(city);
-      attachCity(rebel, city, this.map);
-      rebel.capitalCityId = city.id;
+    nx = Math.max(0, Math.min(this.width - 1, nx));
+    ny = Math.max(0, Math.min(this.height - 1, ny));
+    army.x = nx;
+    army.y = ny;
+    const t = this.terrain[this.idx(Math.round(nx), Math.round(ny))];
+    if (isWater(t)) {
+      army.atSea = true;
+      army.seaMonths++;
+      army.strength = Math.floor(army.strength * 0.975);
+      if (army.seaMonths > 20 || army.strength < 60) {
+        const n = this.nationById(army.nationId);
+        this.pushEvent("war", 1, `${n?.name ?? "?"}の${army.name}は嵐に呑まれ海に消えた。`, n ? [n.id] : [], army.x, army.y);
+        this.disbandArmy(army, false);
+      }
     } else {
-      this.relocateCapital(rebel);
-    }
-
-    for (const other of this.livingNations()) {
-      if (other.id === rebel.id) continue;
-      const atWar = other.id === parent.id;
-      const rel = { status: atWar ? ("war" as const) : ("peace" as const), score: atWar ? -70 : this.rng.int(-20, 10), since: this.year };
-      rebel.relations[other.id] = { ...rel };
-      other.relations[rebel.id] = { ...rel };
-    }
-    return rebel;
-  }
-
-  private regionAround(nation: Nation, seed: { x: number; y: number }, size: number): { x: number; y: number }[] {
-    const region: { x: number; y: number }[] = [];
-    const visited = new Set<string>([tileKey(seed.x, seed.y)]);
-    const queue = [seed];
-    while (queue.length > 0 && region.length < size) {
-      const cur = queue.shift()!;
-      if (this.map.tiles[cur.y]?.[cur.x]?.ownerId !== nation.id) continue;
-      region.push(cur);
-      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-        const nx = cur.x + dx;
-        const ny = cur.y + dy;
-        const k = tileKey(nx, ny);
-        if (visited.has(k)) continue;
-        visited.add(k);
-        if (this.map.tiles[ny]?.[nx]?.ownerId === nation.id) queue.push({ x: nx, y: ny });
-      }
-    }
-    return region;
-  }
-
-  private annexNation(target: Nation, by: Nation) {
-    for (const key of Array.from(target.territory)) {
-      const [x, y] = key.split(",").map(Number);
-      transferTile(target, by, this.map, x, y);
-    }
-    for (const city of this.citiesOf(target.id)) {
-      city.nationId = by.id;
-      city.isCapital = false;
-    }
-    target.cityIds = [];
-    target.overlordId = null;
-    by.population += Math.round(target.population * 0.9);
-    target.population = 0;
-    this.ev("nationFall", "war", { nation: target.name }, [target.id, by.id], [], 2);
-  }
-
-  /** 力を失った小国は、隣の大国に平和的に併合される */
-  private simulateAbsorption() {
-    for (const nation of this.livingNations()) {
-      if (nation.territory.size > 4 || this.isAtWar(nation)) continue;
-      const neighbors = this.livingNations().filter(
-        (n) => n.id !== nation.id && areAdjacent(this.adjacency, n.id, nation.id)
-      );
-      if (neighbors.length === 0) continue;
-      const strongest = neighbors.reduce((a, b) => (powerScore(a) >= powerScore(b) ? a : b));
-      if (powerScore(strongest) < powerScore(nation) * 4) continue;
-      if (!this.rng.bool(0.15)) continue;
-      this.annexNation(nation, strongest);
+      army.atSea = false;
+      army.seaMonths = 0;
     }
   }
 
-  private simulateEmergentNations() {
-    const living = this.livingNations();
-    if (living.length >= Math.max(3, this.config.nationCount - 1) || !this.canSpawnNation()) return;
-    if (!this.rng.bool(0.06)) return;
+  private resolveBattle(a: Army, b: Army, na: Nation, nb: Nation): void {
+    const homeA = this.nationAtTile(Math.round(a.x), Math.round(a.y))?.id === na.id ? 1.12 : 1;
+    const homeB = this.nationAtTile(Math.round(b.x), Math.round(b.y))?.id === nb.id ? 1.12 : 1;
+    const mult = (n: Nation) => 0.7 + n.tech * 0.3;
+    const powA = a.strength * (0.8 + a.morale / 250) * mult(na) * homeA * this.rng.range(0.88, 1.12);
+    const powB = b.strength * (0.8 + b.morale / 250) * mult(nb) * homeB * this.rng.range(0.88, 1.12);
+    const winner = powA >= powB ? a : b;
+    const loser = winner === a ? b : a;
+    const wn = winner === a ? na : nb;
+    const ln = winner === a ? nb : na;
 
-    const tile = findLandTile(this.map, this.rng);
-    if (!tile) return;
+    const lCas = Math.floor(loser.strength * this.rng.range(0.35, 0.55));
+    const wCas = Math.floor(lCas * this.rng.range(0.35, 0.55));
+    loser.strength -= lCas;
+    winner.strength -= wCas;
+    loser.morale = Math.max(5, loser.morale - 30);
+    winner.morale = Math.min(100, winner.morale + 8);
+    ln.warExhaustion = Math.min(100, ln.warExhaustion + 6);
+    wn.warExhaustion = Math.min(100, wn.warExhaustion + 3);
 
-    const id = nextId("nation");
-    const cultureId = this.names.pickCultureId();
-    tile.ownerId = id;
-    const nation = createNation(
-      id,
-      this.names.nationName(cultureId),
-      cultureId,
-      this.names.dynastyName(cultureId),
-      pickColor(this.nations.map((n) => n.color), this.rng),
-      { x: tile.x, y: tile.y },
-      this.year,
-      this.rng
+    const mx = (a.x + b.x) / 2;
+    const my = (a.y + b.y) / 2;
+    this.fx.push({ kind: "battle", x: mx, y: my, age: 0, life: 20 });
+    this.fx.push({ kind: "explosion", x: mx, y: my, age: 0, life: 8, radius: 1.2 });
+    this.pushEvent(
+      "war",
+      1,
+      `${wn.name}軍が${ln.name}軍を破った (損害 ${lCas}/${wCas})。`,
+      [wn.id, ln.id],
+      mx,
+      my
     );
-    for (let i = 0; i < 4; i++) expandTerritory(nation, this.map, this.rng);
 
-    this.addNation(nation);
-    const court = spawnCourt(nation, this.names, this.rng, this.year);
-    this.addPeople(court);
-    const king = court.find((p) => p.role === "king")!;
-
-    const city = createCity(nation, tile.x, tile.y, this.names, this.rng, this.year, true);
-    this.addCity(city);
-    attachCity(nation, city, this.map);
-    nation.capitalCityId = city.id;
-
-    for (const other of this.livingNations()) {
-      if (other.id === nation.id) continue;
-      const rel = { status: "peace" as const, score: this.rng.int(-10, 20), since: this.year };
-      nation.relations[other.id] = { ...rel };
-      other.relations[nation.id] = { ...rel };
+    if (loser.strength < 100) {
+      this.pushEvent("war", 0, `${ln.name}の${loser.name}は壊滅した。`, [ln.id], mx, my);
+      this.disbandArmy(loser, false);
+      ln.military += 100;
+    } else {
+      // 敗軍は後退
+      this.sendArmyHome(loser);
     }
-    this.ev("newNation", "founding", { nation: nation.name, king: king.name }, [nation.id], [king.id], 2, { x: tile.x, y: tile.y });
   }
 
-  private checkNationFalls() {
-    for (const nation of this.livingNations()) {
-      if (nation.territory.size > 0 && nation.population > 400) continue;
-      nation.alive = false;
-      nation.fallYear = this.year;
-      for (const person of this.peopleOf(nation.id)) {
-        person.alive = false;
-        person.diedYear = this.year;
+  private captureCity(city: City, winner: Nation, army: Army): void {
+    const loser = this.nationById(city.nationId);
+    if (!loser) return;
+    const wasCapital = city.isCapital;
+
+    // 都市の所属変更
+    loser.cityIds = loser.cityIds.filter((id) => id !== city.id);
+    city.nationId = winner.id;
+    city.isCapital = false;
+    city.siegeBy = null;
+    city.siegeProgress = 0;
+    city.unrest = 48;
+    city.conqueredYear = this.year;
+    city.fortification = Math.max(0, city.fortification - 25);
+    winner.cityIds.push(city.id);
+
+    // 周辺領土の割譲 (BFS 半径6)
+    const loserIdx = this.nationIdxById.get(loser.id)!;
+    const start = this.idx(city.x, city.y);
+    const visited = new Set<number>([start]);
+    let frontier = [start];
+    this.claimTile(winner, start);
+    for (let r = 0; r < 6; r++) {
+      const next: number[] = [];
+      for (const i of frontier) {
+        const x = i % this.width;
+        const y = Math.floor(i / this.width);
+        for (const [dx, dy] of DIRS4) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (!this.inBounds(nx, ny)) continue;
+          const j = this.idx(nx, ny);
+          if (visited.has(j)) continue;
+          visited.add(j);
+          if (this.owner[j] === loserIdx && this.cityAt[j] === -1) {
+            this.claimTile(winner, j);
+            next.push(j);
+          }
+        }
       }
-      this.armies = this.armies.filter((a) => a.nationId !== nation.id);
-      for (const other of this.nations) {
-        if (other.overlordId === nation.id) other.overlordId = null;
-        delete other.relations[nation.id];
+      frontier = next;
+    }
+
+    // 略奪
+    const loot = Math.min(Math.floor(loser.treasury * 0.35), 500);
+    loser.treasury -= loot;
+    winner.treasury += loot;
+    loser.stability = Math.max(0, loser.stability - 12);
+    army.strength = Math.floor(army.strength * 0.9);
+    army.morale = Math.min(100, army.morale + 10);
+
+    this.fx.push({ kind: "explosion", x: city.x, y: city.y, age: 0, life: 10, radius: 1.6 });
+    this.pushEvent(
+      "war",
+      wasCapital ? 2 : 1,
+      wasCapital
+        ? `${winner.name}が${loser.name}の首都${city.name}を陥落させた!`
+        : `${winner.name}が${city.name}を占領した。`,
+      [winner.id, loser.id],
+      city.x,
+      city.y
+    );
+
+    // 首都を失った場合
+    if (wasCapital) {
+      const rest = loser.cityIds.map((id) => this.cityById(id)).filter((c): c is City => !!c);
+      if (rest.length > 0) {
+        const newCap = rest.reduce((a, b) => (a.population >= b.population ? a : b));
+        newCap.isCapital = true;
+        loser.capitalCityId = newCap.id;
+        this.pushEvent("city", 1, `${loser.name}は${newCap.name}に遷都した。`, [loser.id], newCap.x, newCap.y);
+      } else {
+        loser.capitalCityId = null;
       }
-      nation.relations = {};
-      nation.stats = nation.stats.slice(-24);
-      nation.cityIds = [];
-      nation.armyIds = [];
-      this.ev("nationFall", "war", { nation: nation.name }, [nation.id], [], 2);
+    }
+    this.checkNationDeath(loser, `${winner.name}に征服され`);
+    this.armyPickTarget(army);
+  }
+
+  private checkNationDeath(n: Nation, cause: string): void {
+    if (!n.alive || n.cityIds.length > 0) return;
+    n.alive = false;
+    n.fallYear = this.year;
+    const nIdx = this.nationIdxById.get(n.id)!;
+    // 残存領土の解放
+    for (let i = 0; i < this.owner.length; i++) {
+      if (this.owner[i] === nIdx) {
+        this.owner[i] = -1;
+        this.markDirty(i);
+      }
+    }
+    n.territoryCount = 0;
+    for (const aid of [...n.armyIds]) {
+      const a = this.armies.get(aid);
+      if (a) this.disbandArmy(a, false);
+    }
+    const king = this.people.get(n.kingId ?? "");
+    if (king) king.alive = false;
+    this.pushEvent("founding", 2, `${n.name}は${cause}、歴史から姿を消した (存続${this.year - n.foundedYear}年)。`, [n.id]);
+  }
+
+  // ============================================================
+  // 毎年の処理
+  // ============================================================
+  private updateYearly(): void {
+    // 資源カウント (1パス)
+    const resCount = new Map<number, { gold: number; iron: number; gem: number; grain: number; horse: number; coast: number }>();
+    for (let i = 0; i < this.owner.length; i++) {
+      const o = this.owner[i];
+      if (o < 0) continue;
+      let rec = resCount.get(o);
+      if (!rec) resCount.set(o, (rec = { gold: 0, iron: 0, gem: 0, grain: 0, horse: 0, coast: 0 }));
+      switch (this.resource[i]) {
+        case R.gold:
+          rec.gold++;
+          break;
+        case R.iron:
+          rec.iron++;
+          break;
+        case R.gem:
+          rec.gem++;
+          break;
+        case R.grain:
+          rec.grain++;
+          break;
+        case R.horse:
+          rec.horse++;
+          break;
+      }
+    }
+
+    for (let nIdx = 0; nIdx < this.nations.length; nIdx++) {
+      const n = this.nations[nIdx];
+      if (!n.alive) continue;
+      const res = resCount.get(nIdx) ?? { gold: 0, iron: 0, gem: 0, grain: 0, horse: 0, coast: 0 };
+      const king = this.people.get(n.kingId ?? "");
+
+      // --- 経済 ---
+      let armyUpkeep = 0;
+      for (const aid of n.armyIds) armyUpkeep += (this.armies.get(aid)?.strength ?? 0) * 0.05;
+      const income =
+        n.population * 0.016 * n.tech + res.gold * 35 + res.gem * 26 + res.grain * 9 + n.cityIds.length * 6;
+      const upkeep = armyUpkeep + n.cityIds.length * 10;
+      n.treasury = Math.max(-300, n.treasury + income - upkeep);
+      if (n.treasury < 0) n.stability = Math.max(0, n.stability - 4);
+
+      // --- 軍事力プール ---
+      const manCap = n.population * 0.06 + res.iron * 120;
+      n.military = Math.min(manCap, n.military + n.population * 0.014 + res.iron * 30);
+
+      // --- 技術 ---
+      n.tech += 0.016 + (king ? king.traits.wisdom * 0.0003 : 0) + (n.blessedYears > 0 ? 0.02 : 0);
+
+      // --- 安定度 ---
+      const target =
+        52 +
+        (king ? (king.traits.charisma - 50) / 5 : 0) -
+        n.warExhaustion / 3 -
+        (n.treasury < 0 ? 8 : 0) -
+        (n.cursedYears > 0 ? 15 : 0) +
+        (n.blessedYears > 0 ? 8 : 0);
+      n.stability += (target - n.stability) * 0.25;
+      n.stability = Math.max(0, Math.min(100, n.stability));
+
+      // --- 戦争疲弊 ---
+      if (this.atWarWith(n).length > 0) n.warExhaustion = Math.min(100, n.warExhaustion + 5);
+      else n.warExhaustion = Math.max(0, n.warExhaustion - 8);
+
+      if (n.blessedYears > 0) n.blessedYears--;
+      if (n.cursedYears > 0) n.cursedYears--;
+
+      // --- 都市: 繁栄と不穏 ---
+      for (const cid of n.cityIds) {
+        const c = this.cityById(cid);
+        if (!c) continue;
+        let resNear = false;
+        this.forEachBrush(c.x, c.y, 2, (i) => {
+          if (this.resource[i] !== R.none) resNear = true;
+        });
+        const pTarget =
+          28 + this.fertility[this.idx(c.x, c.y)] * 42 + (c.isCapital ? 16 : 0) + (resNear ? 10 : 0) - (c.siegeBy ? 25 : 0);
+        c.prosperity += (pTarget - c.prosperity) * 0.3;
+        c.prosperity = Math.max(0, Math.min(100, c.prosperity));
+        c.fortification = Math.min(100, c.fortification + (c.isCapital ? 3 : 2));
+
+        // 統治が安定しているほど早く落ち着く (征服地の同化)
+        let dUnrest = -4 - c.prosperity / 25 - (n.stability - 50) / 12;
+        if (n.stability < 32) dUnrest += 6;
+        if (c.conqueredYear && this.year - c.conqueredYear < 8) dUnrest += 5;
+        if (c.plagueTicks > 0) dUnrest += 4;
+        if (n.treasury < 0) dUnrest += 2;
+        // 巨大帝国は辺境の統治が緩む
+        if (n.cityIds.length > 8) dUnrest += (n.cityIds.length - 8) * 0.35;
+        c.unrest = Math.max(0, Math.min(100, c.unrest + dUnrest));
+      }
+
+      // --- AIの都市建設 ---
+      if (
+        n.treasury > 320 &&
+        n.cityIds.length < Math.max(2, Math.floor(n.territoryCount / 38) + 1) &&
+        this.rng.bool(0.5)
+      ) {
+        this.aiFoundCity(n, nIdx);
+      }
+
+      // --- 軍の編成 (戦時) ---
+      const enemies = this.atWarWith(n);
+      if (enemies.length > 0) {
+        const maxArmies = 1 + Math.floor(n.cityIds.length / 3);
+        if (n.armyIds.length < maxArmies && n.military > 500 && n.treasury > 60) {
+          const cap = this.cityById(n.capitalCityId);
+          if (cap) {
+            const strength = Math.min(n.military * 0.55, 500 + n.population * 0.04);
+            n.military -= strength;
+            const army = this.createArmy(n, cap.x, cap.y, strength);
+            this.armyPickTarget(army);
+            this.pushEvent("war", 0, `${n.name}が${army.name} (${Math.round(strength)}) を編成した。`, [n.id], cap.x, cap.y);
+          }
+        }
+      } else if (n.armyIds.length > 0 && this.rng.bool(0.4)) {
+        // 平時は徐々に解散
+        const a = this.armies.get(n.armyIds[0]);
+        if (a && a.state === "guard") this.disbandArmy(a);
+      }
+
+      // --- 反乱 ---
+      this.checkRebellion(n);
+
+      // --- 王位継承 ---
+      this.updateSuccession(n);
+
+      // --- 統計 ---
+      n.stats.push({ y: this.year, pop: n.population, mil: Math.round(n.military), tech: n.tech });
+      if (n.stats.length > 120) n.stats.shift();
+    }
+
+    this.updateDiplomacyYearly();
+
+    this.worldStats.push({ y: this.year, pop: this.worldPopulation(), nations: this.aliveNations().length });
+    if (this.worldStats.length > 240) this.worldStats.shift();
+  }
+
+  private aiFoundCity(n: Nation, nIdx: number): void {
+    // 自国領土から都市候補を探す (他都市から距離7以上)
+    for (let tries = 0; tries < 30; tries++) {
+      const i = this.rng.int(0, this.owner.length - 1);
+      if (this.owner[i] !== nIdx) continue;
+      const x = i % this.width;
+      const y = Math.floor(i / this.width);
+      if (!isPassable(this.terrain[i]) || this.cityAt[i] !== -1) continue;
+      let ok = true;
+      for (const c of this.cities) {
+        if (c.population > 0 && Math.hypot(c.x - x, c.y - y) < 7) {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok || this.fertility[i] < 0.3) continue;
+      n.treasury -= 250;
+      const city = this.createCity(n, x, y, false, this.rng.int(350, 600));
+      if (city) {
+        this.pushEvent("city", 1, `${n.name}が新都市${city.name}を築いた。`, [n.id], x, y);
+      }
+      return;
     }
   }
 
-  private recordStats() {
-    if (this.year % STAT_INTERVAL !== 0) return;
-    for (const nation of this.nations) {
-      if (!nation.alive) continue;
-      const point: StatPoint = { y: this.year, p: nation.population, m: nation.military, t: nation.territory.size };
-      nation.stats.push(point);
-      if (nation.stats.length > MAX_STATS) {
-        const half = nation.stats.filter((_, i) => i % 2 === 0);
-        half.push(point);
-        nation.stats = half;
+  private checkRebellion(n: Nation): void {
+    // 都市が2つ以下の小国は分裂しない
+    if (n.cityIds.length < 3) return;
+    for (const cid of [...n.cityIds]) {
+      const c = this.cityById(cid);
+      if (!c || c.isCapital || c.population < 700) continue;
+      // 中央から遠いほど反乱しやすい
+      const cap = this.cityById(n.capitalCityId);
+      const dist = cap ? Math.hypot(cap.x - c.x, cap.y - c.y) : 99;
+      const far = dist > 12 ? 1 : dist / 12;
+      const chance = 0.07 * far * (n.stability < 45 ? 1.8 : 1);
+      if (c.unrest > 90 && this.rng.bool(chance)) {
+        // 独立
+        n.cityIds = n.cityIds.filter((id) => id !== cid);
+        const rebel = this.foundNation(c.x, c.y, {
+          cultureId: n.cultureId,
+          fromCity: c,
+          radius: 0,
+          silent: true
+        });
+        if (!rebel) {
+          n.cityIds.push(cid);
+          continue;
+        }
+        // 周辺タイルを持っていく
+        const nIdx = this.nationIdxById.get(n.id)!;
+        this.forEachBrush(c.x, c.y, 5, (i) => {
+          if (this.owner[i] === nIdx && this.cityAt[i] === -1) this.claimTile(rebel, i);
+        });
+        c.unrest = 25;
+        n.stability = Math.max(0, n.stability - 10);
+        this.pushEvent("founding", 2, `${c.name}が反乱! ${rebel.name}として独立を宣言した。`, [rebel.id, n.id], c.x, c.y);
+        this.declareWar(rebel, n, "独立戦争", 1);
       }
     }
   }
 
-  private trimAll() {
-    if (this.events.length > MAX_EVENTS) {
-      const cut = this.events.length - Math.floor(MAX_EVENTS * 0.6);
-      const kept = this.events.filter((e, i) => i >= cut || e.importance >= 2);
-      this.events = kept.length > MAX_EVENTS * 1.5 ? kept.slice(-Math.floor(MAX_EVENTS * 1.5)) : kept;
+  private updateSuccession(n: Nation): void {
+    const king = this.people.get(n.kingId ?? "");
+    const heir = this.people.get(n.heirId ?? "");
+    const culture = cultureById(n.cultureId);
+    if (heir) heir.age++;
+    if (!king || !king.alive) return;
+    king.age++;
+
+    let deathChance = king.age < 50 ? 0.008 : (king.age - 45) * 0.0045;
+    if (n.stability < 25 && this.rng.bool(0.06)) {
+      deathChance = 1; // 暗殺
+      this.pushEvent("succession", 2, `${n.name}の${king.name}が暗殺された!`, [n.id]);
+      n.stability = Math.max(0, n.stability - 15);
     }
-    if (this.people.length > MAX_PEOPLE_RECORDS) {
-      const alive = this.people.filter((p) => p.alive);
-      const notableDead = this.people.filter((p) => !p.alive && p.reignStart !== undefined).slice(-120);
-      this.people = [...notableDead, ...alive];
+    if (this.rng.next() < deathChance) {
+      king.alive = false;
+      king.diedYear = this.year;
+      // 二つ名
+      const t = king.traits;
+      if (t.ambition > 78) king.epithet = this.nameGen.epithet("conqueror");
+      else if (t.wisdom > 78) king.epithet = this.nameGen.epithet("wise");
+      else if (t.charisma > 78) king.epithet = this.nameGen.epithet(this.rng.bool() ? "pious" : "builder");
+
+      const title = culture.kingTitle[king.gender];
+      if (heir && heir.alive) {
+        heir.role = "king";
+        heir.reignStart = this.year;
+        n.kingId = heir.id;
+        const newHeir = this.makePerson(n.id, culture, "heir", this.rng.int(4, 14));
+        n.heirId = newHeir.id;
+        const reign = this.year - (king.reignStart ?? this.year);
+        this.pushEvent(
+          "succession",
+          1,
+          `${n.name}の${title}${king.name}${king.epithet ? `「${king.epithet}」` : ""}が崩御 (在位${reign}年)。${heir.name}が即位した。`,
+          [n.id]
+        );
+      } else {
+        // 継承危機
+        const newKing = this.makePerson(n.id, culture, "king", this.rng.int(28, 50));
+        newKing.reignStart = this.year;
+        n.kingId = newKing.id;
+        const newHeir = this.makePerson(n.id, culture, "heir", this.rng.int(4, 14));
+        n.heirId = newHeir.id;
+        n.stability = Math.max(0, n.stability - 20);
+        n.dynasty = this.nameGen.dynastyName(culture, newKing.name);
+        this.pushEvent("succession", 2, `${n.name}で継承危機! 重臣${newKing.name}が王位を奪い、${n.dynasty}が開かれた。`, [n.id]);
+      }
     }
-    this.migrations = this.migrations.filter((m) => this.year - m.year <= 3).slice(-80);
-    this.battles = this.battles.filter((b) => this.year - b.year <= 6).slice(-MAX_MARKS);
   }
 
-  // ==========================================================
-  // 名前の変更 (プレイヤーが自由に命名できる)
-  // ==========================================================
-  renameNation(nationId: string, name: string): boolean {
-    const nation = this.getNation(nationId);
-    const trimmed = name.trim().slice(0, 24);
-    if (!nation || !trimmed || trimmed === nation.name) return false;
-    this.ev("renamed", "divine", { old: nation.name, new: trimmed }, [nation.id], [], 1);
-    nation.name = trimmed;
-    return true;
-  }
+  private updateDiplomacyYearly(): void {
+    const alive = this.aliveNations();
 
-  renamePerson(personId: string, name: string): boolean {
-    const person = this.getPerson(personId);
-    const trimmed = name.trim().slice(0, 24);
-    if (!person || !trimmed || trimmed === person.name) return false;
-    this.ev("renamed", "divine", { old: person.name, new: trimmed }, [person.nationId], [person.id], 1);
-    person.name = trimmed;
-    return true;
-  }
-
-  renameCity(cityId: string, name: string): boolean {
-    const city = this.getCity(cityId);
-    const trimmed = name.trim().slice(0, 24);
-    if (!city || !trimmed || trimmed === city.name) return false;
-    this.ev("renamed", "divine", { old: city.name, new: trimmed }, [city.nationId], [], 1, { x: city.x, y: city.y });
-    city.name = trimmed;
-    return true;
-  }
-
-  // ==========================================================
-  // 神の力
-  // ==========================================================
-  private log(kind: string, description: string) {
-    this.godLog.push({ year: this.year, kind, description });
-  }
-  private lastEvent(): WorldEvent | null {
-    return this.pending[this.pending.length - 1] ?? null;
-  }
-
-  godDisaster(nationId: string): WorldEvent | null {
-    const nation = this.getNation(nationId);
-    if (!nation?.alive) return null;
-    nation.population = Math.round(nation.population * 0.75);
-    nation.stability = Math.max(0, nation.stability - 18);
-    for (const c of this.citiesOf(nation.id)) {
-      c.fortification = Math.max(0, c.fortification - 12);
-      c.prosperity = Math.max(5, c.prosperity - 10);
+    // 関係スコアの自然変動
+    for (let i = 0; i < alive.length; i++) {
+      for (let j = i + 1; j < alive.length; j++) {
+        const a = alive[i];
+        const b = alive[j];
+        const r = this.relation(a, b);
+        const rb = b.relations[a.id]!;
+        if (r.status === "war") continue;
+        if (r.status === "truce" && r.truceUntil !== undefined && this.year >= r.truceUntil) {
+          this.setRelation(a, b, "peace", r.score);
+        }
+        const capA = this.cityById(a.capitalCityId);
+        const capB = this.cityById(b.capitalCityId);
+        const near =
+          capA && capB ? Math.hypot(capA.x - capB.x, capA.y - capB.y) < (this.width + this.height) / 6.5 : false;
+        let drift = this.rng.range(-1.6, 1.6);
+        if (a.cultureId === b.cultureId) drift += 0.5;
+        if (near) drift -= 1.4;
+        if (r.status === "alliance") drift += 2;
+        r.score = rb.score = Math.max(-100, Math.min(100, r.score + drift));
+      }
     }
-    this.ev("godDisaster", "divine", { nation: nation.name }, [nation.id], [], 2, { x: nation.capital.x, y: nation.capital.y });
-    this.log("disaster", `${nation.name}に天災`);
-    return this.lastEvent();
-  }
 
-  godBlessing(nationId: string): WorldEvent | null {
-    const nation = this.getNation(nationId);
-    if (!nation?.alive) return null;
-    nation.treasury += Math.round(nation.population * 0.02);
-    nation.stability = Math.min(100, nation.stability + 15);
-    for (const c of this.citiesOf(nation.id)) c.prosperity = Math.min(100, c.prosperity + 6);
-    this.ev("godBlessing", "divine", { nation: nation.name }, [nation.id], [], 1);
-    this.log("blessing", `${nation.name}に恩恵`);
-    return this.lastEvent();
-  }
+    // 各国の外交判断
+    for (const n of this.rng.shuffle(alive)) {
+      if (!n.alive) continue;
+      const king = this.people.get(n.kingId ?? "");
+      const ambition = king ? king.traits.ambition : 50;
 
-  godDiscoverResource(nationId: string): WorldEvent | null {
-    const nation = this.getNation(nationId);
-    if (!nation?.alive) return null;
-    const resource = this.rng.pick(["gold", "iron", "grain", "gem", "timber"] as ResourceType[]);
-    const candidates = Array.from(nation.territory)
-      .map((k) => k.split(",").map(Number))
-      .filter(([x, y]) => this.map.tiles[y]?.[x] && !this.map.tiles[y][x].resource);
-    if (candidates.length > 0) {
-      const [x, y] = this.rng.pick(candidates);
-      this.map.tiles[y][x].resource = resource;
+      // 開戦
+      if (this.atWarWith(n).length === 0 && n.warExhaustion < 25 && n.stability > 40) {
+        const targets = alive.filter((o) => {
+          if (o.id === n.id || !o.alive) return false;
+          const r = this.relation(n, o);
+          if (r.status !== "peace" || r.score > -35) return false;
+          const capA = this.cityById(n.capitalCityId);
+          const capB = this.cityById(o.capitalCityId);
+          if (!capA || !capB) return false;
+          return Math.hypot(capA.x - capB.x, capA.y - capB.y) < (this.width + this.height) / 5;
+        });
+        if (targets.length > 0 && this.rng.next() < 0.05 + ambition / 800) {
+          const target = targets.reduce((a, b) =>
+            this.relation(n, a).score <= this.relation(n, b).score ? a : b
+          );
+          if (n.military + 500 > target.military * 0.7) {
+            this.declareWar(n, target, king ? `${king.name}の野心のままに。` : "");
+          }
+        }
+      }
+
+      // 講和
+      for (const enemy of this.atWarWith(n)) {
+        const r = this.relation(n, enemy);
+        const yearsAtWar = this.year - r.sinceYear;
+        if (
+          n.warExhaustion > 65 ||
+          (yearsAtWar > 12 && this.rng.bool(0.35)) ||
+          (n.cityIds.length <= 1 && this.rng.bool(0.6))
+        ) {
+          this.makePeace(n, enemy);
+          break;
+        }
+      }
+
+      // 同盟
+      if (this.rng.bool(0.12)) {
+        const friend = alive.find(
+          (o) => o.id !== n.id && o.alive && this.relation(n, o).status === "peace" && this.relation(n, o).score > 62
+        );
+        if (friend) this.makeAlliance(n, friend);
+      }
     }
-    nation.treasury += this.rng.int(150, 400);
-    this.ev("discoveryResource", "divine", { nation: nation.name, resource: RESOURCE_LABEL[resource] }, [nation.id], [], 1);
-    this.log("resource", `${nation.name}で${RESOURCE_LABEL[resource]}発見`);
-    return this.lastEvent();
   }
 
-  godProclaimLaw(
-    nationId: string,
-    law: "lowerTax" | "raiseTax" | "militarize" | "openTrade" | "conscription"
-  ): WorldEvent | null {
-    const nation = this.getNation(nationId);
-    if (!nation?.alive) return null;
-    switch (law) {
-      case "lowerTax":
-        nation.laws.taxRate = Math.max(0.02, nation.laws.taxRate - 0.05);
-        nation.stability = Math.min(100, nation.stability + 6);
-        break;
-      case "raiseTax":
-        nation.laws.taxRate = Math.min(0.5, nation.laws.taxRate + 0.05);
-        nation.stability = Math.max(0, nation.stability - 6);
-        break;
-      case "militarize":
-        nation.laws.militaryFocus = !nation.laws.militaryFocus;
-        break;
-      case "openTrade":
-        nation.laws.tradeOpen = !nation.laws.tradeOpen;
-        break;
-      case "conscription":
-        nation.laws.conscription = !nation.laws.conscription;
-        break;
+  // ============================================================
+  // ユニット (住民・動物・竜)
+  // ============================================================
+  private spawnUnit(kind: Unit["kind"], x: number, y: number, nationId: string | null, homeCityId?: string): Unit {
+    const u: Unit = {
+      id: this.newId("u"),
+      kind,
+      nationId,
+      x,
+      y,
+      px: x,
+      py: y,
+      tx: x,
+      ty: y,
+      hp: kind === "dragon" ? 999 : kind === "wolf" ? 30 : 10,
+      homeCityId: homeCityId ?? null,
+      ttl: kind === "dragon" ? 90 : undefined
+    };
+    this.units.push(u);
+    return u;
+  }
+
+  private updateUnits(): void {
+    // 住民の補充 (都市ごとに人口比で維持)
+    const villagerCount = new Map<string, number>();
+    for (const u of this.units) {
+      if (u.kind === "villager" && u.homeCityId) {
+        villagerCount.set(u.homeCityId, (villagerCount.get(u.homeCityId) ?? 0) + 1);
+      }
     }
-    this.ev("godLaw", "divine", { nation: nation.name }, [nation.id], [], 1);
-    this.log("law", `${nation.name}へ ${law} の詔`);
-    return this.lastEvent();
-  }
-
-  godPlague(nationId: string): WorldEvent | null {
-    const nation = this.getNation(nationId);
-    if (!nation?.alive) return null;
-    nation.population = Math.round(nation.population * 0.8);
-    nation.military = Math.round(nation.military * 0.9);
-    this.ev("godPlague", "divine", { nation: nation.name }, [nation.id], [], 2);
-    this.log("plague", `${nation.name}に疫病`);
-    return this.lastEvent();
-  }
-
-  godUprising(nationId: string): WorldEvent | null {
-    const nation = this.getNation(nationId);
-    if (!nation?.alive) return null;
-    nation.stability = Math.max(0, nation.stability - 30);
-    nation.legitimacy = Math.max(0, nation.legitimacy - 15);
-    for (const c of this.citiesOf(nation.id)) c.unrest = Math.min(100, c.unrest + 30);
-    this.ev("godUprising", "divine", { nation: nation.name }, [nation.id], [], 2);
-    this.log("uprising", `${nation.name}で蜂起`);
-    return this.lastEvent();
-  }
-
-  godSummonHero(nationId: string): WorldEvent | null {
-    const nation = this.getNation(nationId);
-    if (!nation?.alive) return null;
-    const hero = createPerson(nation, "general", this.names, this.rng, this.year, { age: this.rng.int(24, 34), traitBias: 28 });
-    hero.achievements.push("天より遣わされた英雄");
-    hero.loyalty = 95;
-    this.addPerson(hero);
-    nation.military = Math.round(nation.military * 1.15);
-    this.ev("godHero", "divine", { nation: nation.name, hero: hero.name }, [nation.id], [hero.id], 2);
-    this.log("hero", `${nation.name}に英雄${hero.name}`);
-    return this.lastEvent();
-  }
-
-  godFoundCity(nationId: string): WorldEvent | null {
-    const nation = this.getNation(nationId);
-    if (!nation?.alive) return null;
-    const site = findCitySite(nation, this.map, this.cities, 2);
-    if (!site) return null;
-    const city = createCity(nation, site.x, site.y, this.names, this.rng, this.year);
-    city.prosperity = 45;
-    this.addCity(city);
-    attachCity(nation, city, this.map);
-    this.ev("godCity", "divine", { nation: nation.name, city: city.name }, [nation.id], [], 2, { x: city.x, y: city.y });
-    this.log("city", `${nation.name}に都市${city.name}`);
-    return this.lastEvent();
-  }
-
-  godForcePeace(nationId: string): WorldEvent | null {
-    const nation = this.getNation(nationId);
-    if (!nation?.alive) return null;
-    for (const [otherId, rel] of Object.entries(nation.relations)) {
-      if (rel.status !== "war") continue;
-      const other = this.getNation(otherId);
-      if (!other) continue;
-      rel.status = "truce";
-      rel.score = 0;
-      rel.truceUntil = this.year + 25;
-      const back = relationOf(other, nation.id);
-      back.status = "truce";
-      back.score = 0;
-      back.truceUntil = rel.truceUntil;
-      other.warExhaustion = 0;
+    let totalVillagers = this.units.filter((u) => u.kind === "villager").length;
+    for (const c of this.cities) {
+      if (c.population < 150) continue;
+      const want = Math.min(5, Math.max(1, Math.round(c.population / 900)));
+      const have = villagerCount.get(c.id) ?? 0;
+      if (have < want && totalVillagers < 240) {
+        this.spawnUnit("villager", c.x + this.rng.range(-1, 1), c.y + this.rng.range(-1, 1), c.nationId, c.id);
+        totalVillagers++;
+      }
     }
-    nation.warExhaustion = 0;
-    for (const c of this.cities) c.siegeBy = null;
-    this.ev("godPeace", "divine", { nation: nation.name }, [nation.id], [], 2);
-    this.log("peace", `${nation.name}に和平`);
-    return this.lastEvent();
+
+    const dead = new Set<string>();
+    for (const u of this.units) {
+      if (dead.has(u.id)) continue;
+      switch (u.kind) {
+        case "villager": {
+          const home = this.cityById(u.homeCityId);
+          if (!home || home.population < 100) {
+            dead.add(u.id);
+            break;
+          }
+          u.nationId = home.nationId;
+          this.wanderStep(u, home.x, home.y, 5, 0.35);
+          break;
+        }
+        case "sheep": {
+          this.wanderStep(u, u.x, u.y, 4, 0.25);
+          break;
+        }
+        case "wolf": {
+          // 獲物を探す
+          let prey: Unit | null = null;
+          let best = 6;
+          for (const o of this.units) {
+            if (o.kind !== "sheep" && o.kind !== "villager") continue;
+            if (dead.has(o.id)) continue;
+            const d = Math.hypot(o.x - u.x, o.y - u.y);
+            if (d < best) {
+              best = d;
+              prey = o;
+            }
+          }
+          if (prey) {
+            u.tx = prey.x;
+            u.ty = prey.y;
+            this.stepToward(u, 0.5);
+            if (Math.hypot(prey.x - u.x, prey.y - u.y) < 0.7) {
+              dead.add(prey.id);
+              u.hp = Math.min(60, u.hp + 10);
+            }
+          } else {
+            this.wanderStep(u, u.x, u.y, 5, 0.4);
+            u.hp -= 0.4;
+            if (u.hp <= 0) dead.add(u.id);
+          }
+          break;
+        }
+        case "dragon": {
+          if (u.ttl !== undefined) u.ttl--;
+          if ((u.ttl ?? 0) <= 0) {
+            dead.add(u.id);
+            this.pushEvent("disaster", 1, "竜は破壊に飽き、山の彼方へ去っていった。", [], u.x, u.y);
+            break;
+          }
+          // 都市を狙い、なければ徘徊
+          if (Math.hypot(u.tx - u.x, u.ty - u.y) < 1 || this.rng.bool(0.05)) {
+            const targetCity = this.cities.filter((c) => c.population > 300)[this.rng.int(0, Math.max(0, this.cities.length - 1))];
+            if (targetCity && this.rng.bool(0.6)) {
+              u.tx = targetCity.x;
+              u.ty = targetCity.y;
+            } else {
+              u.tx = this.rng.range(2, this.width - 3);
+              u.ty = this.rng.range(2, this.height - 3);
+            }
+          }
+          this.stepToward(u, 0.8);
+          const ti = this.idx(Math.round(u.x), Math.round(u.y));
+          this.igniteTile(ti, 3);
+          const cIdx = this.cityAt[ti];
+          if (cIdx >= 0) {
+            const c = this.cities[cIdx];
+            c.population = Math.max(0, Math.floor(c.population * 0.9));
+            c.fortification = Math.max(0, c.fortification - 8);
+            if (this.rng.bool(0.3)) {
+              this.pushEvent("disaster", 1, `竜が${c.name}を焼いている!`, [c.nationId], c.x, c.y);
+            }
+          }
+          break;
+        }
+      }
+      // 火・水・溶岩によるユニット死亡
+      if (!dead.has(u.id) && u.kind !== "dragon") {
+        const i = this.idx(Math.round(u.x), Math.round(u.y));
+        if (this.burn[i] > 0 || this.terrain[i] === T.lava || isWater(this.terrain[i])) dead.add(u.id);
+      }
+    }
+    if (dead.size > 0) this.units = this.units.filter((u) => !dead.has(u.id));
+    if (this.units.length > 320) this.units.splice(0, this.units.length - 320);
   }
 
-  recordAiNarrative(category: "ai" | "divine", text: string, nationIds: string[] = [], personIds: string[] = []): WorldEvent {
-    const e = makeAiEvent(this.year, category, text, nationIds, personIds, 1);
-    this.pushEvent(e);
-    return e;
+  private wanderStep(u: Unit, anchorX: number, anchorY: number, range: number, speed: number): void {
+    if (Math.hypot(u.tx - u.x, u.ty - u.y) < 0.4 || this.rng.bool(0.06)) {
+      for (let tries = 0; tries < 6; tries++) {
+        const tx = anchorX + this.rng.range(-range, range);
+        const ty = anchorY + this.rng.range(-range, range);
+        const xi = Math.round(tx);
+        const yi = Math.round(ty);
+        if (this.inBounds(xi, yi) && isPassable(this.terrain[this.idx(xi, yi)])) {
+          u.tx = tx;
+          u.ty = ty;
+          break;
+        }
+      }
+    }
+    this.stepToward(u, speed);
   }
 
-  // ==========================================================
-  // 保存 / 復元
-  // ==========================================================
-  toSnapshot(): WorldSnapshot {
+  private stepToward(u: Unit, speed: number): void {
+    const dx = u.tx - u.x;
+    const dy = u.ty - u.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 0.01) return;
+    const s = Math.min(speed, d);
+    const nx = u.x + (dx / d) * s;
+    const ny = u.y + (dy / d) * s;
+    const xi = Math.round(nx);
+    const yi = Math.round(ny);
+    if (u.kind === "dragon" || (this.inBounds(xi, yi) && isPassable(this.terrain[this.idx(xi, yi)]))) {
+      u.x = nx;
+      u.y = ny;
+    } else {
+      u.tx = u.x;
+      u.ty = u.y;
+    }
+  }
+
+  private updateTornadoes(): void {
+    const remove: Tornado[] = [];
+    for (const t of this.tornadoes) {
+      t.ttl--;
+      if (t.ttl <= 0) {
+        remove.push(t);
+        continue;
+      }
+      t.dir += this.rng.range(-0.7, 0.7);
+      t.x = Math.max(1, Math.min(this.width - 2, t.x + Math.cos(t.dir) * 0.8));
+      t.y = Math.max(1, Math.min(this.height - 2, t.y + Math.sin(t.dir) * 0.8));
+      const i = this.idx(Math.round(t.x), Math.round(t.y));
+      // 破壊
+      const tt = this.terrain[i];
+      if (tt === T.forest || tt === T.jungle) {
+        this.terrain[i] = T.plains;
+        this.markDirty(i);
+      }
+      const cIdx = this.cityAt[i];
+      if (cIdx >= 0) {
+        const c = this.cities[cIdx];
+        c.population = Math.max(0, Math.floor(c.population * 0.93));
+        c.fortification = Math.max(0, c.fortification - 6);
+      }
+      // 近くのユニットを吹き飛ばす
+      this.units = this.units.filter((u) => u.kind === "dragon" || Math.hypot(u.x - t.x, u.y - t.y) > 1.2);
+    }
+    if (remove.length > 0) this.tornadoes = this.tornadoes.filter((t) => !remove.includes(t));
+  }
+
+  // ============================================================
+  // 神のツール
+  // ============================================================
+  applyTool(tool: ToolId, x: number, y: number, brush: number, selNationId: string | null): ToolResult {
+    if (!this.inBounds(x, y)) return { ok: false };
+    const i = this.idx(x, y);
+    const sel = this.nationById(selNationId);
+
+    const needSel = (): ToolResult | null =>
+      sel && sel.alive ? null : { ok: false, msg: "先に🔍検分で国家を選択してください" };
+
+    switch (tool) {
+      // ---- 自然 ----
+      case "raise":
+        this.forEachBrush(x, y, brush, (j) => {
+          const t = this.terrain[j];
+          if (t === T.ocean) {
+            this.terrain[j] = T.coast;
+          } else if (t === T.coast) {
+            this.terrain[j] = T.plains;
+            this.fertility[j] = 0.55;
+            this.elevation[j] = 0.47;
+          }
+          this.markDirty(j);
+        });
+        return { ok: true };
+      case "lower":
+        this.forEachBrush(x, y, brush, (j) => {
+          const t = this.terrain[j];
+          if (t === T.mountain || t === T.lava) this.terrain[j] = T.hills;
+          else if (t === T.hills) this.terrain[j] = T.plains;
+          else if (isLand(t)) this.drownTile(j);
+          else if (t === T.coast) this.terrain[j] = T.ocean;
+          this.markDirty(j);
+        });
+        return { ok: true };
+      case "mountain":
+        this.forEachBrush(x, y, brush, (j) => {
+          if (isLand(this.terrain[j]) && this.cityAt[j] === -1) {
+            this.terrain[j] = T.mountain;
+            this.elevation[j] = 0.85;
+            this.markDirty(j);
+          }
+        });
+        return { ok: true };
+      case "forest":
+        this.forEachBrush(x, y, brush, (j) => {
+          const t = this.terrain[j];
+          if (isLand(t) && t !== T.mountain && t !== T.lava && this.cityAt[j] === -1) {
+            this.terrain[j] = T.forest;
+            this.fertility[j] = Math.max(this.fertility[j], 0.55);
+            this.markDirty(j);
+          }
+        });
+        return { ok: true };
+      case "desert":
+        this.forEachBrush(x, y, brush, (j) => {
+          if (isLand(this.terrain[j]) && this.terrain[j] !== T.mountain && this.cityAt[j] === -1) {
+            this.terrain[j] = T.desert;
+            this.fertility[j] = 0.1;
+            this.markDirty(j);
+          }
+        });
+        return { ok: true };
+      case "snow":
+        this.forEachBrush(x, y, brush, (j) => {
+          if (isLand(this.terrain[j]) && this.cityAt[j] === -1) {
+            this.terrain[j] = T.snow;
+            this.fertility[j] = 0.06;
+            this.markDirty(j);
+          }
+        });
+        return { ok: true };
+      case "water":
+        this.forEachBrush(x, y, brush, (j) => {
+          if (isLand(this.terrain[j])) this.drownTile(j);
+          this.markDirty(j);
+        });
+        return { ok: true };
+      case "fertile":
+        this.forEachBrush(x, y, brush, (j) => {
+          if (!isLand(this.terrain[j])) return;
+          this.fertility[j] = Math.min(1, this.fertility[j] + 0.35);
+          if (this.terrain[j] === T.desert) this.terrain[j] = T.savanna;
+          if (this.terrain[j] === T.burnt) this.terrain[j] = T.plains;
+          this.markDirty(j);
+        });
+        this.fx.push({ kind: "heal", x, y, age: 0, life: 14, radius: brush + 1 });
+        return { ok: true };
+      case "res_gold":
+      case "res_iron":
+      case "res_gem": {
+        if (!isLand(this.terrain[i])) return { ok: false, msg: "陸地にしか埋められません" };
+        this.resource[i] = tool === "res_gold" ? R.gold : tool === "res_iron" ? R.iron : R.gem;
+        this.markDirty(i);
+        this.fx.push({ kind: "spark", x, y, age: 0, life: 12 });
+        return { ok: true };
+      }
+
+      // ---- 生命 ----
+      case "settlers": {
+        if (!isPassable(this.terrain[i])) return { ok: false, msg: "陸地に落としてください" };
+        const ownerN = this.nationAtTile(x, y);
+        if (ownerN) {
+          // 既存国への移民
+          const nearest = this.nearestCityOf(ownerN, x, y);
+          if (nearest) nearest.population += 300;
+          this.fx.push({ kind: "heal", x, y, age: 0, life: 12, radius: 1.5 });
+          return { ok: true, msg: `${ownerN.name}に移民が加わった (+300人)` };
+        }
+        const nation = this.foundNation(x, y, { pop: 550, radius: 1 });
+        if (!nation) return { ok: false, msg: "ここには住めません" };
+        for (let k = 0; k < 3; k++) {
+          this.spawnUnit("villager", x + this.rng.range(-1, 1), y + this.rng.range(-1, 1), nation.id, nation.capitalCityId ?? undefined);
+        }
+        this.fx.push({ kind: "heal", x, y, age: 0, life: 14, radius: 2 });
+        return { ok: true, msg: `入植者が${nation.name}を興した` };
+      }
+      case "sheep":
+      case "wolf": {
+        if (!isPassable(this.terrain[i])) return { ok: false, msg: "陸地に放してください" };
+        const animals = this.units.filter((u) => u.kind === "sheep" || u.kind === "wolf").length;
+        if (animals > 120) return { ok: false, msg: "動物が多すぎます" };
+        this.spawnUnit(tool, x, y, null);
+        return { ok: true };
+      }
+      case "dragon": {
+        this.spawnUnit("dragon", x, y, null);
+        this.pushEvent("disaster", 2, "空が翳り、竜が舞い降りた!", [], x, y);
+        return { ok: true };
+      }
+
+      // ---- 文明 ----
+      case "found_nation": {
+        if (!isPassable(this.terrain[i])) return { ok: false, msg: "陸地を選んでください" };
+        if (this.nationAtTile(x, y)) return { ok: false, msg: "他国の領土です" };
+        const nation = this.foundNation(x, y, { pop: 1500, radius: 2 });
+        if (!nation) return { ok: false, msg: "ここには建国できません" };
+        return { ok: true, msg: `${nation.name}が誕生した` };
+      }
+      case "found_city": {
+        const err = needSel();
+        if (err) return err;
+        if (!isPassable(this.terrain[i]) || this.cityAt[i] !== -1) return { ok: false, msg: "ここには建てられません" };
+        for (const c of this.cities) {
+          if (c.population > 0 && Math.hypot(c.x - x, c.y - y) < 4) return { ok: false, msg: "他の都市に近すぎます" };
+        }
+        const other = this.nationAtTile(x, y);
+        if (other && other.id !== sel!.id) return { ok: false, msg: "他国の領土です (領土授与で塗り替えられます)" };
+        const city = this.createCity(sel!, x, y, false, 500);
+        if (!city) return { ok: false };
+        this.forEachBrush(x, y, 1, (j) => {
+          if (isLand(this.terrain[j]) && this.owner[j] === -1) this.claimTile(sel!, j);
+        });
+        this.pushEvent("divine", 1, `神の意志により、${sel!.name}に都市${city.name}が築かれた。`, [sel!.id], x, y);
+        return { ok: true, msg: `${city.name}を建設` };
+      }
+      case "claim": {
+        const err = needSel();
+        if (err) return err;
+        this.forEachBrush(x, y, brush, (j) => {
+          if (!isLand(this.terrain[j])) return;
+          const cIdx = this.cityAt[j];
+          if (cIdx >= 0) {
+            const c = this.cities[cIdx];
+            if (c.nationId !== sel!.id) this.handOverCity(c, sel!);
+          }
+          this.claimTile(sel!, j);
+        });
+        return { ok: true };
+      }
+      case "give_gold": {
+        const err = needSel();
+        if (err) return err;
+        sel!.treasury += 500;
+        const cap = this.cityById(sel!.capitalCityId);
+        if (cap) this.fx.push({ kind: "heal", x: cap.x, y: cap.y, age: 0, life: 12, radius: 1.5 });
+        return { ok: true, msg: `${sel!.name}に500Gを授けた` };
+      }
+      case "give_tech": {
+        const err = needSel();
+        if (err) return err;
+        sel!.tech += 0.15;
+        return { ok: true, msg: `${sel!.name}の技術が進歩した (${sel!.tech.toFixed(2)})` };
+      }
+      case "summon_army": {
+        const err = needSel();
+        if (err) return err;
+        if (!isPassable(this.terrain[i])) return { ok: false, msg: "陸地に召喚してください" };
+        const army = this.createArmy(sel!, x, y, 1200 * (0.7 + sel!.tech * 0.3));
+        this.armyPickTarget(army);
+        this.fx.push({ kind: "spark", x, y, age: 0, life: 12 });
+        this.pushEvent("divine", 1, `神の号令により${sel!.name}の${army.name}が現れた。`, [sel!.id], x, y);
+        return { ok: true };
+      }
+
+      // ---- 災厄 ----
+      case "lightning": {
+        this.fx.push({ kind: "lightning", x, y, age: 0, life: 8 });
+        this.igniteTile(i, 2);
+        const cIdx = this.cityAt[i];
+        if (cIdx >= 0) {
+          const c = this.cities[cIdx];
+          c.population = Math.max(0, c.population - this.rng.int(80, 220));
+          c.fortification = Math.max(0, c.fortification - 5);
+        }
+        this.units = this.units.filter((u) => u.kind === "dragon" || Math.hypot(u.x - x, u.y - y) > 1.1);
+        return { ok: true };
+      }
+      case "meteor": {
+        const r = Math.max(1, brush);
+        this.fx.push({ kind: "meteor", x, y, age: 0, life: 10, radius: r });
+        this.fx.push({ kind: "explosion", x, y, age: 0, life: 14, radius: r + 1 });
+        let cityHit: City | null = null;
+        this.forEachBrush(x, y, r, (j) => {
+          if (isLand(this.terrain[j])) {
+            this.terrain[j] = T.burnt;
+            this.fertility[j] = 0.1;
+            this.igniteTile(j, 2);
+            this.markDirty(j);
+          }
+          const cIdx = this.cityAt[j];
+          if (cIdx >= 0) {
+            const c = this.cities[cIdx];
+            c.population = Math.max(0, Math.floor(c.population * 0.4));
+            c.fortification = Math.max(0, c.fortification - 50);
+            cityHit = c;
+            if (c.population < 150) this.destroyCity(c, "隕石の直撃で");
+          }
+        });
+        this.units = this.units.filter((u) => Math.hypot(u.x - x, u.y - y) > r + 0.5);
+        this.pushEvent(
+          "disaster",
+          cityHit ? 2 : 1,
+          cityHit ? `隕石が${(cityHit as City).name}付近に落着! 大地が焼け焦げた。` : "隕石が大地に落ち、クレーターを刻んだ。",
+          cityHit ? [(cityHit as City).nationId] : [],
+          x,
+          y
+        );
+        return { ok: true };
+      }
+      case "volcano": {
+        if (isWater(this.terrain[i])) return { ok: false, msg: "海には火山を作れません" };
+        this.terrain[i] = T.lava;
+        this.elevation[i] = 0.95;
+        this.markDirty(i);
+        this.forEachBrush(x, y, 1, (j) => {
+          if (j === i) return;
+          if (isLand(this.terrain[j]) && this.cityAt[j] === -1) {
+            this.terrain[j] = this.rng.bool(0.5) ? T.lava : T.mountain;
+            this.markDirty(j);
+          }
+        });
+        this.forEachBrush(x, y, 3, (j) => this.igniteTile(j, 3));
+        this.fx.push({ kind: "explosion", x, y, age: 0, life: 16, radius: 3 });
+        this.fx.push({ kind: "smoke", x, y, age: 0, life: 60 });
+        this.pushEvent("disaster", 2, "大地が裂け、火山が噴火した!", [], x, y);
+        return { ok: true };
+      }
+      case "fire": {
+        this.forEachBrush(x, y, brush, (j) => this.igniteTile(j, 4));
+        return { ok: true };
+      }
+      case "plague": {
+        let target: City | null = null;
+        let best = 4;
+        for (const c of this.cities) {
+          if (c.population < 100) continue;
+          const d = Math.hypot(c.x - x, c.y - y);
+          if (d < best) {
+            best = d;
+            target = c;
+          }
+        }
+        if (!target) return { ok: false, msg: "都市の近くで使ってください" };
+        target.plagueTicks = 24;
+        this.pushEvent("disaster", 2, `${target.name}で疫病が発生! 街は死の影に覆われた。`, [target.nationId], target.x, target.y);
+        return { ok: true };
+      }
+      case "earthquake": {
+        const r = Math.max(2, brush + 1);
+        this.fx.push({ kind: "quake", x, y, age: 0, life: 16, radius: r });
+        let hitNation: string | null = null;
+        this.forEachBrush(x, y, r, (j) => {
+          if (this.terrain[j] === T.mountain && this.rng.bool(0.3)) {
+            this.terrain[j] = T.hills;
+            this.markDirty(j);
+          }
+          const cIdx = this.cityAt[j];
+          if (cIdx >= 0) {
+            const c = this.cities[cIdx];
+            c.fortification = Math.max(0, c.fortification - 45);
+            c.population = Math.max(0, Math.floor(c.population * 0.9));
+            c.unrest = Math.min(100, c.unrest + 15);
+            hitNation = c.nationId;
+          }
+        });
+        this.pushEvent("disaster", hitNation ? 2 : 1, "大地が震え、城壁が崩れ落ちた。", hitNation ? [hitNation] : [], x, y);
+        return { ok: true };
+      }
+      case "tornado": {
+        this.tornadoes.push({ x, y, px: x, py: y, dir: this.rng.range(0, Math.PI * 2), ttl: 50 });
+        this.pushEvent("disaster", 1, "不気味な風が渦を巻き、竜巻が生まれた。", [], x, y);
+        return { ok: true };
+      }
+      case "curse": {
+        const err = needSel();
+        if (err) return err;
+        sel!.cursedYears = 6;
+        sel!.stability = Math.max(0, sel!.stability - 20);
+        for (const cid of sel!.cityIds) {
+          const c = this.cityById(cid);
+          if (c) c.unrest = Math.min(100, c.unrest + 20);
+        }
+        this.pushEvent("divine", 2, `神の怒りが${sel!.name}に降りかかった。民心は乱れ、大地は痩せていく。`, [sel!.id]);
+        return { ok: true };
+      }
+
+      // ---- 外交 ----
+      case "peace_light": {
+        const n = this.nationAtTile(x, y);
+        if (!n) return { ok: false, msg: "国家の領土をクリックしてください" };
+        const enemies = this.atWarWith(n);
+        if (enemies.length === 0) return { ok: false, msg: `${n.name}は戦争をしていません` };
+        for (const e of enemies) this.makePeace(n, e, "神の光が争いを鎮めた。");
+        n.blessedYears = Math.max(n.blessedYears, 3);
+        this.pushEvent("divine", 2, `神の光が${n.name}を包み、すべての戦火が消えた。`, [n.id]);
+        return { ok: true };
+      }
+      case "war_seed": {
+        const n = this.nationAtTile(x, y);
+        if (!n) return { ok: false, msg: "国家の領土をクリックしてください" };
+        const others = this.aliveNations().filter((o) => o.id !== n.id && this.relation(n, o).status !== "war");
+        if (others.length === 0) return { ok: false, msg: "戦える相手がいません" };
+        const target = others.reduce((a, b) => (this.relation(n, a).score <= this.relation(n, b).score ? a : b));
+        this.relation(n, target).score = -80;
+        target.relations[n.id]!.score = -80;
+        this.declareWar(n, target, "神が憎悪の種を蒔いた。");
+        return { ok: true };
+      }
+      case "alliance_bond": {
+        const n = this.nationAtTile(x, y);
+        if (!n) return { ok: false, msg: "国家の領土をクリックしてください" };
+        const others = this.aliveNations().filter(
+          (o) => o.id !== n.id && this.relation(n, o).status === "peace"
+        );
+        if (others.length === 0) return { ok: false, msg: "同盟できる相手がいません" };
+        const friend = others.reduce((a, b) => (this.relation(n, a).score >= this.relation(n, b).score ? a : b));
+        this.makeAlliance(n, friend);
+        return { ok: true, msg: `${n.name}と${friend.name}が結ばれた` };
+      }
+
+      default:
+        return { ok: false };
+    }
+  }
+
+  private drownTile(j: number): void {
+    const cIdx = this.cityAt[j];
+    if (cIdx >= 0) this.destroyCity(this.cities[cIdx], "大水に呑まれ");
+    this.freeTile(j);
+    this.terrain[j] = T.coast;
+    this.elevation[j] = 0.38;
+    this.river[j] = 0;
+    this.resource[j] = R.none;
+    this.burn[j] = 0;
+    this.burningTiles.delete(j);
+  }
+
+  private destroyCity(city: City, cause: string): void {
+    const n = this.nationById(city.nationId);
+    const i = this.idx(city.x, city.y);
+    const cIdx = this.cityAt[i];
+    if (cIdx >= 0 && this.cities[cIdx].id === city.id) this.cityAt[i] = -1;
+    city.population = 0;
+    city.siegeBy = null;
+    if (n) {
+      n.cityIds = n.cityIds.filter((id) => id !== city.id);
+      this.pushEvent("disaster", 2, `都市${city.name}は${cause}滅びた。`, [n.id], city.x, city.y);
+      if (city.isCapital) {
+        city.isCapital = false;
+        const rest = n.cityIds.map((id) => this.cityById(id)).filter((c): c is City => !!c);
+        if (rest.length > 0) {
+          const newCap = rest.reduce((a, b) => (a.population >= b.population ? a : b));
+          newCap.isCapital = true;
+          n.capitalCityId = newCap.id;
+        } else {
+          n.capitalCityId = null;
+        }
+      }
+      this.checkNationDeath(n, cause);
+    }
+  }
+
+  private handOverCity(city: City, to: Nation): void {
+    const from = this.nationById(city.nationId);
+    if (!from) return;
+    from.cityIds = from.cityIds.filter((id) => id !== city.id);
+    const wasCapital = city.isCapital;
+    city.isCapital = false;
+    city.nationId = to.id;
+    city.siegeBy = null;
+    city.siegeProgress = 0;
+    to.cityIds.push(city.id);
+    this.pushEvent("divine", 1, `神の采配で${city.name}は${to.name}のものとなった。`, [to.id, from.id], city.x, city.y);
+    if (wasCapital) {
+      const rest = from.cityIds.map((id) => this.cityById(id)).filter((c): c is City => !!c);
+      if (rest.length > 0) {
+        const newCap = rest.reduce((a, b) => (a.population >= b.population ? a : b));
+        newCap.isCapital = true;
+        from.capitalCityId = newCap.id;
+      } else {
+        from.capitalCityId = null;
+      }
+    }
+    this.checkNationDeath(from, "神に見放され");
+  }
+
+  private nearestCityOf(n: Nation, x: number, y: number): City | null {
+    let best: City | null = null;
+    let bd = Infinity;
+    for (const cid of n.cityIds) {
+      const c = this.cityById(cid);
+      if (!c) continue;
+      const d = Math.hypot(c.x - x, c.y - y);
+      if (d < bd) {
+        bd = d;
+        best = c;
+      }
+    }
+    return best;
+  }
+
+  // ============================================================
+  // セーブ / ロード
+  // ============================================================
+  toSnapshot(): unknown {
+    const round3 = (arr: Float32Array) => Array.from(arr, (v) => Math.round(v * 1000) / 1000);
     return {
-      version: SNAPSHOT_VERSION,
+      v: SNAPSHOT_VERSION,
       config: this.config,
-      year: this.year,
-      faith: this.faith,
-      counters: getIdCounters(),
-      nations: this.nations.map((n) => ({ ...n, territory: Array.from(n.territory) })),
-      people: this.people,
+      tick: this.tick,
+      rngState: this.rng.getState(),
+      idCounter: this.idCounter,
+      eventId: this.eventId,
+      terrain: Array.from(this.terrain),
+      elevation: round3(this.elevation),
+      moisture: round3(this.moisture),
+      fertility: round3(this.fertility),
+      river: Array.from(this.river),
+      resource: Array.from(this.resource),
+      owner: Array.from(this.owner),
+      burn: Array.from(this.burn),
+      nations: this.nations.map((n) => ({ ...n, stats: n.stats.slice(-60) })),
       cities: this.cities,
-      armies: this.armies,
-      events: this.events,
-      battles: this.battles,
-      migrations: this.migrations,
-      godLog: this.godLog
+      people: [...this.people.values()],
+      armies: [...this.armies.values()],
+      events: this.events.slice(-300),
+      worldStats: this.worldStats.slice(-240),
+      usedNames: this.nameGen.exportUsed()
     };
   }
 
-  static fromSnapshot(snapshot: WorldSnapshot): GameWorld | null {
-    if (!snapshot || snapshot.version !== SNAPSHOT_VERSION) return null;
-
-    const world = new GameWorld(snapshot.config);
-    world.year = snapshot.year;
-    world.faith = snapshot.faith ?? 30;
-    world.rng = new Rng((snapshot.config.seed ^ (snapshot.year * 2654435761)) >>> 0);
-    world.names = new NameGenerator(world.rng);
-    setIdCounters(snapshot.counters);
-
-    world.nations = snapshot.nations.map((n) => ({ ...n, territory: new Set(n.territory) }));
-    world.people = snapshot.people;
-    world.cities = snapshot.cities ?? [];
-    world.armies = snapshot.armies ?? [];
-    world.events = snapshot.events;
-    world.battles = snapshot.battles ?? [];
-    world.migrations = snapshot.migrations ?? [];
-    world.godLog = snapshot.godLog ?? [];
-
-    for (const nation of world.nations) {
-      if (!nation.alive) continue;
-      for (const key of nation.territory) {
-        const [x, y] = key.split(",").map(Number);
-        const tile = world.map.tiles[y]?.[x];
-        if (tile) tile.ownerId = nation.id;
-      }
-    }
-    for (const city of world.cities) {
-      const tile = world.map.tiles[city.y]?.[city.x];
-      if (tile) tile.cityId = city.id;
-    }
-    world.adjacency = computeAdjacency(world.map);
-    world.reindex();
-    return world;
+  static fromSnapshot(data: any): World {
+    if (!data || data.v !== SNAPSHOT_VERSION) throw new Error("セーブデータのバージョンが違います");
+    const w = new World(data.config as WorldConfig, true);
+    w.tick = data.tick;
+    w.rng.setState(data.rngState);
+    w.idCounter = data.idCounter;
+    w.eventId = data.eventId;
+    w.terrain = Uint8Array.from(data.terrain);
+    w.elevation = Float32Array.from(data.elevation);
+    w.moisture = Float32Array.from(data.moisture);
+    w.fertility = Float32Array.from(data.fertility);
+    w.river = Uint8Array.from(data.river);
+    w.resource = Uint8Array.from(data.resource);
+    w.owner = Int16Array.from(data.owner);
+    w.burn = Uint8Array.from(data.burn);
+    w.nations = data.nations;
+    w.cities = data.cities;
+    w.people = new Map((data.people as Person[]).map((p) => [p.id, p]));
+    w.armies = new Map((data.armies as Army[]).map((a) => [a.id, a]));
+    w.events = data.events;
+    w.worldStats = data.worldStats ?? [];
+    w.nameGen.importUsed(data.usedNames);
+    // 再構築
+    w.nationIdxById.clear();
+    w.nations.forEach((n, i) => w.nationIdxById.set(n.id, i));
+    w.cityAt.fill(-1);
+    w.cities.forEach((c, i) => {
+      if (c.population > 0) w.cityAt[w.idx(c.x, c.y)] = i;
+    });
+    w.burningTiles.clear();
+    for (let i = 0; i < w.burn.length; i++) if (w.burn[i] > 0) w.burningTiles.add(i);
+    w.needFullRepaint = true;
+    return w;
   }
 }
-
-function clamp(v: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, v));
-}
-
-export { tileKey, powerScore };
