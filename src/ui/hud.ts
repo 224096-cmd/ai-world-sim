@@ -177,8 +177,8 @@ export class Hud {
     // 速度
     const speedGroup = el("div", "segmented speed-seg");
     SPEEDS.forEach((s) => {
-      const b = el("button", "seg-btn", s === 0 ? "⏸" : `×${s}`);
-      b.title = s === 0 ? "一時停止 (Space)" : `${s}倍速`;
+      const b = el("button", "seg-btn", s === 0 ? "停止" : `×${s}`);
+      b.title = s === 0 ? "時間を止める (Space)" : `${s}倍速`;
       b.onclick = () => this.setSpeed(s);
       speedGroup.appendChild(b);
       this.speedBtns.push(b);
@@ -202,10 +202,6 @@ export class Hud {
     this.inspectCard = el("div", "inspect-card hidden");
     root.appendChild(this.inspectCard);
 
-    // ---------- トースト ----------
-    this.toastWrap = el("div", "toast-wrap");
-    root.appendChild(this.toastWrap);
-
     // ---------- 神器帯 (下部ツールベルト) ----------
     const belt = el("div", "godbelt");
 
@@ -222,8 +218,16 @@ export class Hud {
     });
     belt.appendChild(catRow);
 
+    // ツール一覧(左)と出来事の流れ(右)を横に並べる。
+    // 以前は画面上部にトーストを出していたが、地図に重なって
+    // 読みにくかったため、ここの空きに移した。
+    const beltMain = el("div", "belt-main");
     this.toolGrid = el("div", "tool-grid");
-    belt.appendChild(this.toolGrid);
+    beltMain.appendChild(this.toolGrid);
+
+    this.toastWrap = el("div", "toast-wrap");
+    beltMain.appendChild(this.toastWrap);
+    belt.appendChild(beltMain);
 
     const bottomRow = el("div", "belt-bottom");
     this.toolDesc = el("div", "tool-desc");
@@ -943,15 +947,19 @@ export class Hud {
   // ============================================================
   // トースト
   // ============================================================
+  /**
+   * 出来事を神器帯の右側に流す。
+   * 一定時間で消えると読み逃すため、新しいものを上に積んで残す。
+   * 溜まりすぎたら古いものから捨てる。
+   */
   toast(text: string, kind: "info" | "war" | "divine" | "disaster" = "info"): void {
     const t = el("div", `toast ${kind}`, text);
-    this.toastWrap.appendChild(t);
-    setTimeout(() => t.classList.add("show"), 10);
-    setTimeout(() => {
-      t.classList.remove("show");
-      setTimeout(() => t.remove(), 400);
-    }, 3600);
-    while (this.toastWrap.children.length > 5) this.toastWrap.removeChild(this.toastWrap.children[0]);
+    this.toastWrap.prepend(t);
+    requestAnimationFrame(() => t.classList.add("show"));
+    while (this.toastWrap.children.length > 40) {
+      this.toastWrap.removeChild(this.toastWrap.lastElementChild!);
+    }
+    this.toastWrap.scrollTop = 0;
   }
 
   // ============================================================
@@ -961,7 +969,10 @@ export class Hud {
     const w = this.world;
     this.timeChip.innerHTML = `<b>${w.year}</b><span class="unit">年</span> <span class="mon">${
       MONTH_LABEL[w.month]
-    }</span><span class="season">${seasonOf(w.month)}</span>`;
+    }</span><span class="season">${seasonOf(w.month)}</span>${
+      this.speed === 0 ? '<span class="paused-tag">停止中</span>' : ""
+    }`;
+    this.timeChip.classList.toggle("is-paused", this.speed === 0);
     this.worldChip.innerHTML = `<span>🏰 ${w.aliveNations().length}</span><span>👥 ${formatNum(
       w.worldPopulation()
     )}</span><span>⚔ ${this.countWars()}</span>`;

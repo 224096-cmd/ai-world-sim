@@ -86,6 +86,8 @@ let activeTool: ToolId = "inspect";
 let accumulator = 0;
 let lastFrame = performance.now();
 let lastToolApply = 0;
+// 描画アニメーション用の時計。停止中は進めないので、画面が完全に静止する。
+let animClock = 0;
 
 // ============================================================
 // 世界の入れ替え
@@ -331,6 +333,7 @@ function frame(now: number): void {
   lastFrame = now;
 
   if (speed > 0) {
+    animClock += dt;
     accumulator += dt * speed;
     const interval = TICK_MS;
     let steps = 0;
@@ -350,7 +353,7 @@ function frame(now: number): void {
   }
 
   const simAlpha = speed > 0 ? Math.min(1, accumulator / TICK_MS) : 1;
-  renderer.render(renderState, simAlpha, now);
+  renderer.render(renderState, simAlpha, animClock);
   if (Math.floor(now / 500) !== Math.floor((now - dt) / 500)) {
     renderer.drawMinimap(hud.minimap);
   }

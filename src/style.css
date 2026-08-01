@@ -172,6 +172,19 @@ body {
   color: var(--text-dim);
   margin-left: 2px;
 }
+.time-chip.is-paused {
+  border-color: var(--gold-dim);
+}
+.paused-tag {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-family: var(--sans);
+  color: var(--gold);
+  background: rgba(217, 164, 65, 0.14);
+  border: 1px solid rgba(217, 164, 65, 0.45);
+}
 .world-chip {
   gap: 10px;
   font-size: 12px;
@@ -1142,51 +1155,69 @@ select.input {
 }
 
 /* ============================================================
-   トースト
+   出来事の流れ
+   地図に重ねると読みにくいので、神器帯の右の空きに置く。
+   新しいものが上に積まれる。
    ============================================================ */
+.belt-main {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+.belt-main .tool-grid {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .toast-wrap {
-  position: absolute;
-  top: calc(var(--top-h) + env(safe-area-inset-top) + 8px);
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 30;
+  flex: 0 0 300px;
   display: flex;
   flex-direction: column;
-  gap: 5px;
-  align-items: center;
-  pointer-events: none;
-  width: min(430px, 92vw);
+  gap: 1px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 3px 5px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.28);
+  scrollbar-width: thin;
+}
+.toast-wrap::-webkit-scrollbar {
+  width: 4px;
+}
+.toast-wrap::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 2px;
 }
 .toast {
-  max-width: 100%;
-  padding: 8px 14px;
-  border-radius: 999px;
-  font-size: 12px;
-  line-height: 1.5;
-  background: rgba(15, 21, 36, 0.95);
-  border: 1px solid var(--line);
-  color: var(--text);
-  box-shadow: var(--shadow);
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  border-left: 2px solid var(--line);
   opacity: 0;
-  transform: translateY(-8px);
-  transition: 0.3s cubic-bezier(0.3, 0.8, 0.4, 1);
-  text-align: center;
+  transform: translateX(8px);
+  transition: opacity 0.25s, transform 0.25s;
 }
 .toast.show {
   opacity: 1;
-  transform: translateY(0);
+  transform: none;
 }
 .toast.war {
-  border-color: rgba(200, 80, 60, 0.55);
+  border-left-color: rgba(200, 80, 60, 0.85);
   color: #f0b3a8;
 }
 .toast.divine {
-  border-color: rgba(217, 164, 65, 0.55);
+  border-left-color: rgba(217, 164, 65, 0.85);
   color: #f0dca8;
 }
 .toast.disaster {
-  border-color: rgba(180, 90, 200, 0.5);
+  border-left-color: rgba(180, 90, 200, 0.8);
   color: #e5b6f0;
+}
+.toast.info {
+  border-left-color: rgba(120, 170, 210, 0.7);
 }
 
 /* ============================================================
@@ -1309,9 +1340,15 @@ select.input {
   .tool-ico {
     font-size: 20px;
   }
-  .toast {
-    font-size: 11px;
-    padding: 7px 12px;
+  /* 横に並べる余裕が無いので、出来事はツール一覧の下へ */
+  .belt-main {
+    flex-direction: column;
+    gap: 5px;
+  }
+  .toast-wrap {
+    flex: 0 0 auto;
+    width: 100%;
+    max-height: 42px;
   }
 }
 
